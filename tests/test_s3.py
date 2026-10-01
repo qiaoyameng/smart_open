@@ -13,6 +13,7 @@ import random
 import re
 import sys
 import tempfile
+import threading
 import unittest
 import warnings
 from collections import defaultdict
@@ -1108,6 +1109,161 @@ class IterBucketTest(unittest.TestCase):
 # This has to be a separate test because we cannot run it against real S3
 # (we don't want to expose our real S3 credentials).
 #
+@mock_s3
+class IterBucketOrderedTest(unittest.TestCase):
+    """Tests for the ordered, byte-capped download pipeline of iter_bucket."""
+
+    def setUp(self):
+        """SetUp."""
+        ignore_resource_warnings()
+        s3 = _resource("s3")
+        s3.create_bucket(Bucket=BUCKET_NAME).wait_until_exists()
+        self.client = s3.meta.client
+
+    def _put(self, key, body):
+        self.client.put_object(Bucket=BUCKET_NAME, Key=key, Body=body)
+
+    def test_order_and_cache_peak_with_slow_first_key(self):
+        """A slow first object is not overtaken, and the byte cap holds."""
+        size = 256 * 1024
+        keys = [f"key_{i}" for i in range(6)]
+        contents = {key: bytes([i + 1]) * size for i, key in enumerate(keys)}
+        for key in keys:
+            self._put(key, contents[key])
+
+        max_buffered_bytes = 3 * size
+        slow_key = keys[0]
+        release_slow = threading.Event()
+        completed = []
+        lock = threading.Lock()
+
+        def fake_download(*, client, bucket_name, key_name, transfer_config):
+            if key_name == slow_key:
+                # stay blocked until two later objects have finished downloading
+                release_slow.wait(timeout=30)
+                return contents[key_name]
+            content = contents[key_name]
+            with lock:
+                completed.append(key_name)
+                if len(completed) == 2:
+                    release_slow.set()
+            return content
+
+        budgets = []
+        real_budget = smart_open.s3._ByteBudget
+
+        class RecordingBudget(real_budget):
+            def __init__(self, limit):
+                super().__init__(limit)
+                self.peak = 0
+                budgets.append(self)
+
+            def try_acquire(self, size):
+                acquired = super().try_acquire(size)
+                if acquired:
+                    self.peak = max(self.peak, self._used)  # test reaches into private state
+                return acquired
+
+        with (
+            mock.patch("smart_open.s3._download_fileobj", side_effect=fake_download),
+            mock.patch("smart_open.s3._ByteBudget", RecordingBudget),
+        ):
+            results = list(
+                smart_open.s3.iter_bucket(
+                    BUCKET_NAME,
+                    workers=4,
+                    max_buffered_bytes=max_buffered_bytes,
+                )
+            )
+
+        # later objects finished downloading before the slow first object...
+        assert set(completed[:2]) == {"key_1", "key_2"}
+        assert slow_key not in completed
+        # ...but the results still come out strictly in listing order
+        assert [key for key, _ in results] == keys
+        assert dict(results) == contents
+        # the byte cap was respected, and downloads really did overlap
+        assert len(budgets) == 1
+        assert budgets[0].peak <= max_buffered_bytes
+        assert budgets[0].peak >= 2 * size
+
+    def test_oversized_object_spills_to_temporary_file(self):
+        """An object larger than the byte cap goes through a temporary file."""
+        small_body = b"s" * 128
+        big_body = b"b" * 4096
+        self._put("big_key", big_body)
+        self._put("small_key", small_body)
+
+        created = []
+        real_temporary_file = tempfile.TemporaryFile
+
+        def spy_temporary_file(*args, **kwargs):
+            fileobj = real_temporary_file(*args, **kwargs)
+            created.append(fileobj)
+            return fileobj
+
+        def fake_download_to(*, client, bucket_name, key_name, transfer_config, fileobj):
+            fileobj.write(big_body)
+
+        with (
+            mock.patch("smart_open.s3._download_fileobj", return_value=small_body),
+            mock.patch("smart_open.s3._download_fileobj_to", side_effect=fake_download_to),
+            mock.patch("smart_open.s3.tempfile.TemporaryFile", spy_temporary_file),
+        ):
+            results = list(
+                smart_open.s3.iter_bucket(BUCKET_NAME, workers=2, max_buffered_bytes=1024)
+            )
+
+        assert results == [("big_key", big_body), ("small_key", small_body)]
+        assert len(created) == 1
+        assert created[0].closed
+
+    def test_early_close_cancels_pending_downloads(self):
+        """Stopping early cancels downloads that have not started yet."""
+        keys = [f"key_{i}" for i in range(8)]
+        for key in keys:
+            self._put(key, b"x")
+
+        gate = threading.Event()
+        started = []
+        lock = threading.Lock()
+
+        def fake_download(*, client, bucket_name, key_name, transfer_config):
+            with lock:
+                started.append(key_name)
+            if key_name != "key_0":
+                gate.wait(timeout=30)
+            return b"content"
+
+        with mock.patch("smart_open.s3._download_fileobj", side_effect=fake_download):
+            iterator = smart_open.s3.iter_bucket(BUCKET_NAME, workers=2)
+            key, _content = next(iterator)
+            assert key == "key_0"
+            # don't leave the in-flight worker threads blocked forever
+            threading.Timer(1.0, gate.set).start()
+            iterator.close()
+
+        # queued downloads were cancelled before they could start
+        assert set(started) <= set(keys[:3])
+        assert len(started) < len(keys)
+
+    def test_download_error_identifies_key(self):
+        """A failed download raises an error that carries the key name."""
+        populate_bucket()
+
+        def fail(*, client, bucket_name, key_name, transfer_config):
+            raise ARBITRARY_CLIENT_ERROR
+
+        with mock.patch("smart_open.s3._download_fileobj", side_effect=fail):
+            iterator = smart_open.s3.iter_bucket(BUCKET_NAME, workers=2)
+            with pytest.raises(botocore.exceptions.ClientError) as exc_info:
+                list(iterator)
+
+        error = exc_info.value
+        notes = getattr(error, "__notes__", [])
+        assert any("key_0" in note for note in notes) or getattr(error, "key_name", None) == "key_0"
+
+
 @mock_s3
 class IterBucketCredentialsTest(unittest.TestCase):
     """Tests for Iter Bucket Credentials."""
