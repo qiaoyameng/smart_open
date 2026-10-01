@@ -24,6 +24,7 @@ PACKAGE CONTENTS
     concurrency
     constants
     doctools
+    encryption
     ftp
     gcs
     hdfs
@@ -37,7 +38,7 @@ PACKAGE CONTENTS
     webhdfs
 
 FUNCTIONS
-    open(uri: 'Uri', mode: 'str' = 'r', buffering: 'int' = -1, encoding: 'str | None' = None, errors: 'str | None' = None, newline: 'str | None' = None, closefd: 'bool' = True, opener: 'Callable[[str, int], int] | None' = None, compression: 'str' = 'infer_from_extension', compression_kwargs: 'CompressionKwargs | None' = None, transport_params: 'TransportParams | None' = None) -> 'IO[Any]'
+    open(uri: 'Uri', mode: 'str' = 'r', buffering: 'int' = -1, encoding: 'str | None' = None, errors: 'str | None' = None, newline: 'str | None' = None, closefd: 'bool' = True, opener: 'Callable[[str, int], int] | None' = None, compression: 'str' = 'infer_from_extension', compression_kwargs: 'CompressionKwargs | None' = None, encryption: 'str' = 'disable', encryption_kwargs: 'EncryptionKwargs | None' = None, transport_params: 'TransportParams | None' = None) -> 'IO[Any]'
         Open the URI object, returning a file-like object.
 
         The URI is usually a string in a variety of formats.
@@ -68,6 +69,14 @@ FUNCTIONS
                 or ``{'compression_level': 16}`` for .lz4. Ignored when compression
                 is 'disable' or the URI's extension doesn't match a registered
                 compressor.
+            encryption: Explicitly enable transparent segmented authenticated
+                encryption.  See ``smart_open.encryption.get_supported_encryption_types``.
+                The default, 'disable', reads/writes the data as-is.
+            encryption_kwargs: Keyword arguments forwarded to the encryption layer.
+                Must contain the caller-provided secret ``key`` (bytes) when
+                encryption is enabled; supports an optional ``segment_size`` (in
+                bytes) when writing.  The key is never logged or embedded in the
+                URI by smart_open.  Ignored when encryption is 'disable'.
             transport_params: Additional parameters for the transport layer (see
                 notes below).
 
@@ -77,7 +86,8 @@ FUNCTIONS
         Raises:
             TypeError: If ``mode`` is not a string or if the URI type is not
                 recognized.
-            ValueError: If ``compression`` is not a supported value.
+            ValueError: If ``compression`` or ``encryption`` is not a supported
+                value.
             NotImplementedError: If ``mode`` cannot be parsed into a valid binary
                 mode.
 

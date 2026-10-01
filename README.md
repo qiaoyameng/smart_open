@@ -310,6 +310,40 @@ It was a bright cold day in Apri
 
 This is just an example: `lzma` is in the standard library and is registered by default.
 
+### Encryption Handling
+
+The top-level `encryption` parameter enables transparent, segmented, authenticated
+encryption on top of any transport. It is disabled by default; the only supported
+value besides `disable` is `aesgcm` (AES-GCM via the `cryptography` package).
+Compression (if any) always happens before encryption when writing, and after
+decryption when reading.
+
+The secret key is supplied by the caller via `encryption_kwargs` — never through
+the URI — and is never logged by `smart_open`:
+
+```python
+>>> import os
+>>> from smart_open import open
+>>> key = os.urandom(32)  # 16, 24 and 32-byte AES keys are supported
+>>> with open('s3://bucket/backup.txt.gz', 'wb', encryption='aesgcm',
+...           encryption_kwargs={'key': key, 'segment_size': 1 << 20}) as fout:
+...     _ = fout.write(b'hello world')
+>>> with open('s3://bucket/backup.txt.gz', 'rb', encryption='aesgcm',
+...           encryption_kwargs={'key': key}) as fin:
+...     print(fin.read())
+b'hello world'
+
+```
+
+The stream is split into independently authenticated segments, so reading and
+writing never require buffering more than one segment in memory. Each segment's
+tag is verified before its plaintext is released, and the stream carries a
+version, a random file identifier, monotonically increasing segment sequence
+numbers and an authenticated final record. Reordered, duplicated, truncated,
+extended or tampered objects raise `smart_open.encryption.EncryptionError`, and
+once a segment fails verification, no further plaintext is produced. See the
+`smart_open/encryption.py` module docstring for the precise on-the-wire format.
+
 ### Transport-specific Options
 
 `smart_open` supports a wide range of transport options out of the box.

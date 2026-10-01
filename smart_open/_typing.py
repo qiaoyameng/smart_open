@@ -29,5 +29,8 @@ TransportParams: TypeAlias = dict[str, Any]
 CompressionKwargs: TypeAlias = dict[str, Any]
 """Keyword arguments forwarded to a registered compressor callback."""
 
+EncryptionKwargs: TypeAlias = dict[str, Any]
+"""Keyword arguments forwarded to the encryption layer (e.g. the secret key)."""
+
 Compressor: TypeAlias = Callable[..., IO[Any]]
 """A compressor callback registered via :func:`smart_open.register_compressor`."""
