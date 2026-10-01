@@ -96,10 +96,37 @@ def _handle_bz2(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
     return _maybe_wrap_buffered(result, mode)
 
 
-def _handle_gzip(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
+def _handle_gzip(  # noqa: FBT001, FBT002  # keyword-only in practice
+    file_obj: IO[bytes], mode: str, reproducible: bool = False, **kwargs: Any
+) -> IO[Any]:
     import gzip
 
-    result = gzip.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
+    if reproducible and ("w" in mode or "a" in mode):
+        #
+        # Fix the gzip header metadata so that identical input always produces
+        # identical output bytes, regardless of when or where it is written:
+        #
+        # - filename="": omit the FNAME field (otherwise the basename of the
+        #   underlying file object is embedded in the header)
+        # - mtime=0: zero out the MTIME field (otherwise the current wall-clock
+        #   time is embedded in the header)
+        #
+        # The compression level still affects the output bytes.  It defaults to
+        # 9 (gzip's own default) and may be overridden via the compresslevel
+        # keyword argument; it must be identical across runs for the output to
+        # be identical.  Reading is unaffected by this option.
+        #
+        compresslevel = kwargs.pop("compresslevel", 9)
+        result = gzip.GzipFile(  # noqa: SIM115  # returns the file object to caller
+            filename="",
+            mode=mode,
+            compresslevel=compresslevel,
+            fileobj=file_obj,
+            mtime=0,
+            **kwargs,
+        )
+    else:
+        result = gzip.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
     return _maybe_wrap_buffered(result, mode)
 
 

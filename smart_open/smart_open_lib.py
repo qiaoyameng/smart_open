@@ -176,6 +176,11 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             or ``{'compression_level': 16}`` for .lz4. Ignored when compression
             is 'disable' or the URI's extension doesn't match a registered
             compressor.
+            For .gz, ``{'reproducible': True}`` additionally makes the output
+            byte-for-byte reproducible: the gzip header omits the file name and
+            uses a zero timestamp, and text mode defaults to UTF-8 encoding and
+            "\n" newlines.  The compression level still affects the output;
+            keep it identical across runs (the default is 9).
         transport_params: Additional parameters for the transport layer (see
             notes below).
 
@@ -215,6 +220,18 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
 
     if transport_params is None:
         transport_params = {}
+
+    reproducible = bool(compression_kwargs and compression_kwargs.get("reproducible"))
+    if reproducible and ("b" not in mode or encoding is not None):
+        #
+        # Reproducible output must not depend on the locale or the platform,
+        # so default to UTF-8 and "\n" newlines in text mode.  Explicitly
+        # requested encoding/newline settings are left untouched.
+        #
+        if encoding is None:
+            encoding = "utf-8"
+        if newline is None:
+            newline = "\n"
 
     fobj = _shortcut_open(
         uri,
