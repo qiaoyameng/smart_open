@@ -310,6 +310,49 @@ It was a bright cold day in Apri
 
 This is just an example: `lzma` is in the standard library and is registered by default.
 
+### Encrypted Backups (authenticated)
+
+For backups written to object storage you can opt in to an explicit, streaming
+authenticated-encryption layer. Pass an `AESGCMEncryption` config as the
+`encryption` argument. It uses AES-GCM from the [`cryptography`](https://cryptography.io/)
+package (install with `pip install smart_open[crypto]`), seals the stream in
+independently authenticated segments, and verifies each segment *before* its
+plaintext is delivered on read.
+
+```python
+import os
+from smart_open import AESGCMEncryption, open
+
+key = os.urandom(32)  # 32 bytes => AES-256; caller-managed, never part of the URI
+
+with open("s3://bucket/backup.gz", "wb",
+          compression=".gz", encryption=AESGCMEncryption(key)) as fout:
+    fout.write(payload)
+
+with open("s3://bucket/backup.gz", "rb",
+          compression=".gz", encryption=AESGCMEncryption(key)) as fin:
+    assert fin.read() == payload
+```
+
+Properties:
+
+- **Explicit opt-in**: encryption is off unless you pass `encryption=...`;
+  nothing is inferred from the URI, and the key is never read from, or written
+  into, a URI or a log line (`repr` redacts it).
+- **Compress-then-encrypt**: compression runs first; the ciphertext stored in
+  the object contains no compression fingerprints.
+- **Streaming**: objects are never buffered whole; memory is bounded by one
+  segment (64 KiB by default, configurable via `chunk_size`).
+- **Tamper detection**: each segment carries a random 96-bit nonce and an AES-GCM
+  tag over its ciphertext and authenticated metadata (format version, random
+  per-file id, segment sequence and record type). An authenticated terminal
+  record seals the number of segments, so reordering, duplication, dropping,
+  truncation, trailing bytes and tag/key tampering all raise `EncryptionError`
+  and stop all further output.
+
+The on-disk/on-wire format (version 1, magic `b"SOAE"`) is documented in full in
+`smart_open/encryption.py`, so independent implementations can interoperate.
+
 ### Transport-specific Options
 
 `smart_open` supports a wide range of transport options out of the box.

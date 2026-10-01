@@ -29,8 +29,9 @@ requires-python = ">=3.10,<4.0" # sync with classifiers above
 urls = {Repository = "https://github.com/piskvorky/smart_open"}
 
 [project.optional-dependencies]
-all = ["smart_open[s3,gcs,azure,http,webhdfs,ssh,zst,lz4]"]
+all = ["smart_open[s3,gcs,azure,http,webhdfs,ssh,zst,lz4,crypto]"]
 azure = ["azure-storage-blob>=12.7.0", "azure-common", "azure-core"]
+crypto = ["cryptography>=42.0.0"]
 gcs = ["google-cloud-storage>=2.6.0"]
 http = ["requests"]
 lz4 = ["lz4"]

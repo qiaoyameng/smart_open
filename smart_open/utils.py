@@ -178,13 +178,21 @@ class TextIOWrapper(io.TextIOWrapper):
 
 
 class FileLikeProxy(wrapt.ObjectProxy):
-    """Wrap an `outer` file-like object so that closing it also closes `inner`."""
+    """Wrap an `outer` file-like object so that closing it also closes `inner`.
+
+    Extra positional ``also_close`` streams are closed afterwards, in order.
+    Closing the wrapped chain first lets buffered layers (compression,
+    authenticated encryption) flush their trailers before the raw transport
+    stream is closed and the object is committed.
+    """
 
     __inner: Any = ...  # initialized before wrapt disallows __setattr__ on certain objects
+    __also_close: Any = ...
 
-    def __init__(self, outer: IO[Any], inner: IO[Any]) -> None:
+    def __init__(self, outer: IO[Any], inner: IO[Any], *also_close: IO[Any]) -> None:
         super().__init__(outer)
         self.__inner = inner
+        self.__also_close = also_close
 
     def __enter__(self) -> Any:
         """This explicit proxy method is only required for pylance ref #916."""
@@ -201,15 +209,20 @@ class FileLikeProxy(wrapt.ObjectProxy):
             return super().__exit__(exc_type, exc_value, traceback)
         finally:
             self.__inner.__exit__(exc_type, exc_value, traceback)
+            for extra in self.__also_close:
+                extra.__exit__(exc_type, exc_value, traceback)
 
     def __next__(self) -> Any:
         """Delegate iteration to the wrapped file-like object."""
         return self.__wrapped__.__next__()
 
     def close(self) -> None:
-        """Close both the wrapped object and the inner object."""
+        """Close the wrapped object, then the inner and any extra streams."""
         try:
-            return self.__wrapped__.close()
+            self.__wrapped__.close()
         finally:
             if self.__inner != self.__wrapped__:  # Don't close again if inner and wrapped are the same
                 self.__inner.close()
+            for extra in self.__also_close:
+                if extra != self.__wrapped__ and extra != self.__inner:
+                    extra.close()

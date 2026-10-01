@@ -34,10 +34,18 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 from .compression import register_compressor  # noqa: E402  # logger setup precedes imports (see #474)
+from .encryption import (  # noqa: E402  # logger setup precedes imports (see #474)
+    AESGCMEncryption,
+    DEFAULT_CHUNK_SIZE,
+    EncryptionError,
+)
 from .smart_open_lib import open, parse_uri  # noqa: E402  # logger setup precedes imports (see #474)
 
 __all__ = [
     "open",
     "parse_uri",
     "register_compressor",
+    "AESGCMEncryption",
+    "EncryptionError",
+    "DEFAULT_CHUNK_SIZE",
 ]

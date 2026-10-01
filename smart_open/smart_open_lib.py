@@ -20,6 +20,7 @@ import urllib.parse
 from typing import IO, TYPE_CHECKING, Any, BinaryIO, Literal, TextIO, cast, overload
 
 import smart_open.compression as so_compression
+import smart_open.encryption as so_encryption
 
 #
 # This module defines a function called smart_open so we cannot use
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 
     from typing_extensions import Self
 
-    from smart_open._typing import CompressionKwargs, TransportParams, Uri
+    from smart_open._typing import CompressionKwargs, Encryption, TransportParams, Uri
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    encryption: Encryption | None = ...,
 ) -> TextIO: ...
 
 
@@ -114,6 +116,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    encryption: Encryption | None = ...,
 ) -> BinaryIO: ...
 
 
@@ -130,6 +133,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    encryption: Encryption | None = ...,
 ) -> IO[Any]: ...
 
 
@@ -145,6 +149,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     compression: str = so_compression.INFER_FROM_EXTENSION,
     compression_kwargs: CompressionKwargs | None = None,
     transport_params: TransportParams | None = None,
+    encryption: Encryption | None = None,
 ) -> IO[Any]:
     r"""Open the URI object, returning a file-like object.
 
@@ -178,6 +183,16 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             compressor.
         transport_params: Additional parameters for the transport layer (see
             notes below).
+        encryption: When ``None`` (the default), no encryption is applied.
+            Pass an explicit config such as
+            ``AESGCMEncryption(key)`` to encrypt the stream with
+            authenticated AES-GCM segments before it reaches the transport,
+            and to transparently verify and decrypt it on read. The key is
+            supplied out-of-band only -- never embed it in the URI. On read,
+            every segment is authenticated before its plaintext is delivered;
+            any tampering, reordering, duplication or truncation aborts the
+            stream. When compression is also enabled, compression happens
+            first and the compressed bytes are what gets encrypted.
 
     Returns:
         A file-like object.
@@ -203,7 +218,16 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         - `smart_open README.md
           <https://github.com/piskvorky/smart_open/blob/master/README.md>`__
     """
-    logger.debug("%r", locals())
+    if encryption is not None:
+        # Never log the key or let it reach a URI: log only a redacted descriptor.
+        logger.debug(
+            "open(mode=%r, compression=%r, encryption=%r)",
+            mode,
+            compression,
+            encryption if not isinstance(encryption, (bytes, bytearray)) else b"<redacted>",
+        )
+    else:
+        logger.debug("open(mode=%r, compression=%r, encryption=None)", mode, compression)
 
     if not isinstance(mode, str):
         msg = "mode should be a string"
@@ -216,6 +240,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     if transport_params is None:
         transport_params = {}
 
+    encryption_config = so_encryption.validate_encryption(encryption)
+
     fobj = _shortcut_open(
         uri,
         mode,
@@ -224,6 +250,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         encoding=encoding,
         errors=errors,
         newline=newline,
+        encryption_enabled=encryption_config is not None,
     )
     if fobj is not None:
         return fobj
@@ -263,12 +290,31 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     except ValueError as ve:
         raise NotImplementedError(ve.args[0]) from ve
 
+    if encryption_config is not None and "a" in binary_mode:
+        msg = "encryption does not support append mode; open the object for writing instead"
+        raise ValueError(msg)
+
     binary = _open_binary_stream(uri, binary_mode, transport_params)
     name = getattr(binary, "name", None)
     # prefer the stream's own name; if it's not string-like (e.g. ftp socket fileno), fall back to uri
     filename = name if isinstance(name, str) else uri if isinstance(uri, str) else None
+    #
+    # The encryption layer sits between compression and the transport:
+    # compression first, then authenticated encryption, then the object store.
+    # On read, each encrypted segment is verified before decompression touches
+    # it. ``encrypted`` (not the raw transport stream) is the file the caller
+    # eventually closes, so a close propagates the authenticated terminal write.
+    #
+    if encryption_config is not None:
+        if "w" in binary_mode:
+            encrypted: IO[Any] = encryption_config.writer(binary)
+        else:
+            encrypted = encryption_config.reader(binary)
+    else:
+        encrypted = binary
+
     decompressed = so_compression.compression_wrapper(
-        binary,
+        encrypted,
         binary_mode,
         compression,
         filename=filename,
@@ -297,7 +343,13 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             with contextlib.suppress(AttributeError):
                 setattr(decoded, attr, getattr(binary, attr))
 
-    return cast("IO[Any]", so_utils.FileLikeProxy(decoded, binary))
+    #
+    # Closing must flush the whole chain (e.g. the gzip footer and the
+    # authenticated terminal) before the raw transport stream is closed and
+    # the object is committed.
+    #
+    also_close = (binary,) if decompressed is not binary else ()
+    return cast("IO[Any]", so_utils.FileLikeProxy(decoded, decompressed, *also_close))
 
 
 def _get_binary_mode(mode_str: str) -> str:  # noqa: C901  # legacy internal helper; refactor in a dedicated PR
@@ -363,6 +415,7 @@ def _shortcut_open(  # noqa: PLR0913  # legacy internal helper; refactor in a de
     encoding: str | None = None,
     errors: str | None = None,
     newline: str | None = None,
+    encryption_enabled: bool = False,  # noqa: FBT001  # internal flag
 ) -> IO[Any] | None:
     """Try to open the URI using the standard library io.open function.
 
@@ -390,6 +443,10 @@ def _shortcut_open(  # noqa: PLR0913  # legacy internal helper; refactor in a de
         The opened file, or None if no shortcut is possible.
     """
     if not isinstance(uri, str):
+        return None
+
+    if encryption_enabled:
+        # Encrypted I/O always goes through the wrapping layers below.
         return None
 
     scheme = _sniff_scheme(uri)

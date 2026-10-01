@@ -31,3 +31,10 @@ CompressionKwargs: TypeAlias = dict[str, Any]
 
 Compressor: TypeAlias = Callable[..., IO[Any]]
 """A compressor callback registered via :func:`smart_open.register_compressor`."""
+
+Encryption: TypeAlias = Any
+"""An explicit encryption config (e.g. ``AESGCMEncryption``) or raw key bytes.
+
+Supplied to :func:`smart_open.open`; never part of the URI. Structurally it
+exposes ``reader(raw)``/``writer(raw)`` file-like factories.
+"""
