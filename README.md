@@ -403,6 +403,21 @@ Official/annual/monthly_rain/2012.monthly_rain.nc 13
 
 ```
 
+### Reading Many Objects as One Stream
+
+Logs and large datasets are often split across many objects. `smart_open.concat()` reads such a collection as a single text stream: the path list may be produced lazily (e.g. by a generator), the next object is opened only after the previous one is exhausted, and empty objects are skipped automatically. `readline` and iteration join text across object boundaries when an object does not end with a newline, and `tell()` reports the logical offset (characters returned so far, across all objects):
+
+```python
+>>> from smart_open import concat
+>>> paths = (f's3://bucket/logs/{i:04d}' for i in range(1000))  # lazy
+>>> with concat(paths, encoding='utf-8') as fin:
+...     fin.read(6)        # read and iteration may be interleaved freely
+...     fin.tell()         # logical offset: characters returned so far
+...     next(fin)          # continues exactly where read() stopped
+```
+
+By default each object is decoded independently (`reset_decoder=True`): a multi-byte character truncated at the end of an object is never completed by bytes from the next object. Pass `reset_decoder=False` to share one decoder across the whole concatenation. If an object fails to open mid-stream, `smart_open.ConcatError` carries the object `index` and the logical `offset` at the failure.
+
 ### GCS Credentials
 
 `smart_open` uses the `google-cloud-storage` library to talk to GCS.

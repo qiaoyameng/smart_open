@@ -34,9 +34,13 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 from .compression import register_compressor  # noqa: E402  # logger setup precedes imports (see #474)
+from .concat import ConcatError, ConcatReader, concat  # noqa: E402  # logger setup precedes imports (see #474)
 from .smart_open_lib import open, parse_uri  # noqa: E402  # logger setup precedes imports (see #474)
 
 __all__ = [
+    "concat",
+    "ConcatError",
+    "ConcatReader",
     "open",
     "parse_uri",
     "register_compressor",
