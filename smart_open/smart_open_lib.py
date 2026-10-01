@@ -19,6 +19,8 @@ import pathlib
 import urllib.parse
 from typing import IO, TYPE_CHECKING, Any, BinaryIO, Literal, TextIO, cast, overload
 
+import wrapt
+
 import smart_open.compression as so_compression
 
 #
@@ -97,6 +99,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    write_session: bool = ...,
 ) -> TextIO: ...
 
 
@@ -114,6 +117,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    write_session: bool = ...,
 ) -> BinaryIO: ...
 
 
@@ -130,6 +134,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    write_session: bool = ...,
 ) -> IO[Any]: ...
 
 
@@ -145,6 +150,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     compression: str = so_compression.INFER_FROM_EXTENSION,
     compression_kwargs: CompressionKwargs | None = None,
     transport_params: TransportParams | None = None,
+    write_session: bool = False,  # noqa: FBT001, FBT002  # public API
 ) -> IO[Any]:
     r"""Open the URI object, returning a file-like object.
 
@@ -178,6 +184,9 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             compressor.
         transport_params: Additional parameters for the transport layer (see
             notes below).
+        write_session: Return an explicit staged write session with
+            ``finish()``, ``commit()`` and ``abort()`` methods. This is only
+            supported for write modes and transports with staging support.
 
     Returns:
         A file-like object.
@@ -208,6 +217,21 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     if not isinstance(mode, str):
         msg = "mode should be a string"
         raise TypeError(msg)
+
+    if write_session:
+        return write_session_open(
+            uri,
+            mode=mode,
+            buffering=buffering,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            closefd=closefd,
+            opener=opener,
+            compression=compression,
+            compression_kwargs=compression_kwargs,
+            transport_params=transport_params,
+        )
 
     if compression not in so_compression.get_supported_compression_types():
         msg = f"invalid compression type: {compression}"
@@ -298,6 +322,193 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
                 setattr(decoded, attr, getattr(binary, attr))
 
     return cast("IO[Any]", so_utils.FileLikeProxy(decoded, binary))
+
+
+def write_session_open(  # noqa: PLR0913
+    uri: Uri,
+    mode: str = "w",
+    buffering: int = -1,  # noqa: ARG001  # mirrors smart_open.open; staged streams manage buffering
+    encoding: str | None = None,
+    errors: str | None = None,
+    newline: str | None = None,
+    closefd: bool = True,  # noqa: ARG001, FBT001  # mirrors smart_open.open
+    opener: Callable[[str, int], int] | None = None,  # noqa: ARG001  # mirrors smart_open.open
+    compression: str = so_compression.INFER_FROM_EXTENSION,
+    compression_kwargs: CompressionKwargs | None = None,
+    transport_params: TransportParams | None = None,
+) -> IO[Any]:
+    """Open a write session whose remote object is only published by ``commit()``."""
+    if not isinstance(mode, str):
+        msg = "mode should be a string"
+        raise TypeError(msg)
+
+    if compression not in so_compression.get_supported_compression_types():
+        msg = f"invalid compression type: {compression}"
+        raise ValueError(msg)
+
+    if isinstance(uri, pathlib.Path):
+        uri = str(uri)
+
+    binary_mode = _get_binary_mode(mode)
+    if binary_mode != "wb":
+        msg = "write sessions require a write mode"
+        raise ValueError(msg)
+
+    if not isinstance(uri, str):
+        msg = f"write sessions require a URI string, got {uri!r}"
+        raise TypeError(msg)
+
+    if transport_params is None:
+        transport_params = {}
+
+    scheme = _sniff_scheme(uri)
+    submodule = transport.get_transport(scheme)
+    if not getattr(submodule, "SUPPORTS_WRITE_SESSIONS", False):
+        msg = f"{scheme or 'file'} transport does not support write sessions"
+        raise NotImplementedError(msg)
+
+    binary = _open_write_session_binary(uri, binary_mode, transport_params)
+    staged_raw = _StagedRawProxy(binary)
+    filename = staged_raw.name if isinstance(staged_raw.name, str) else uri
+    compressed = so_compression.compression_wrapper(
+        staged_raw,
+        binary_mode,
+        compression,
+        filename=filename,
+        compression_kwargs=compression_kwargs,
+    )
+
+    explicit_encoding = encoding
+    if "b" not in mode or explicit_encoding is not None:
+        decoded = _encoding_wrapper(
+            compressed,
+            mode,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+        )
+    else:
+        decoded = compressed
+
+    if decoded != staged_raw:
+        with contextlib.suppress(AttributeError):
+            setattr(decoded, "to_boto3", getattr(staged_raw, "to_boto3"))
+
+    return cast("IO[Any]", WriteSession(decoded, staged_raw))
+
+
+open_write_session = write_session_open
+write_session = write_session_open
+
+
+class _StagedRawProxy(wrapt.ObjectProxy):
+    """Protect a staged transport from ordinary outer-layer close commits."""
+
+    def __init__(self, raw: IO[bytes]) -> None:
+        super().__init__(raw)
+        self._self_discarding = False
+
+    def write(self, b: Any) -> int:
+        """Discard buffered encoder/compressor output after an abort."""
+        if self._self_discarding:
+            return len(memoryview(b))
+        return self.__wrapped__.write(b)
+
+    def flush(self) -> None:
+        """Flush the staged stream unless its contents are being discarded."""
+        if not self._self_discarding:
+            self.__wrapped__.flush()
+
+    def discard(self) -> None:
+        """Ignore buffered data written by outer wrappers during abort."""
+        self._self_discarding = True
+
+    def keep(self) -> None:
+        """Resume accepting data after an aborted cleanup attempt failed."""
+        self._self_discarding = False
+
+    def close(self) -> None:
+        """Finish staged bytes when an outer wrapper closes normally."""
+        if not self._self_discarding:
+            self.__wrapped__.finish()
+
+
+class WriteSession(wrapt.ObjectProxy):
+    """A staged write stream with explicit finish, commit, and abort phases."""
+
+    def __init__(self, outer: IO[Any], staged_raw: _StagedRawProxy) -> None:
+        super().__init__(outer)
+        self._self_raw = staged_raw
+        self._self_state = "open"
+
+    @property
+    def closed(self) -> bool:
+        """Return whether writing has been finished, committed, or aborted."""
+        return self._self_state != "open"
+
+    def finish(self) -> None:
+        """Completely flush text and compression layers, then finish staging."""
+        if self._self_state == "finished":
+            return
+        if self._self_state in ("committed", "aborted"):
+            msg = f"cannot finish a {self._self_state} write session"
+            raise ValueError(msg)
+        self.__wrapped__.close()
+        self._self_raw.finish()
+        self._self_state = "finished"
+
+    def commit(self) -> None:
+        """Finish if needed, then publish the staged destination."""
+        if self._self_state == "committed":
+            return
+        if self._self_state == "aborted":
+            msg = "cannot commit an aborted write session"
+            raise ValueError(msg)
+        if self._self_state == "open":
+            self.finish()
+        self._self_raw.commit()
+        self._self_state = "committed"
+
+    def abort(self) -> None:
+        """Discard staged bytes without publishing the destination."""
+        if self._self_state == "aborted":
+            return
+        if self._self_state == "committed":
+            msg = "cannot abort a committed write session"
+            raise ValueError(msg)
+        self._self_raw.discard()
+        try:
+            self._self_raw.abort()
+        except Exception:
+            self._self_raw.keep()
+            self._self_state = "open"
+            raise
+        with contextlib.suppress(Exception):
+            self.__wrapped__.close()
+        self._self_state = "aborted"
+
+    def close(self) -> None:
+        """Finish the stream without publishing it; use commit or abort explicitly."""
+        if self._self_state == "open":
+            self.finish()
+
+    def __enter__(self) -> Any:
+        return self
+
+    def to_boto3(self, resource: Any) -> Any:
+        """Create an independent boto3 object when the staged transport supports it."""
+        return self._self_raw.to_boto3(resource)
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: Any,
+    ) -> None:
+        if exc_type is not None:
+            self.abort()
+        else:
+            self.close()
 
 
 def _get_binary_mode(mode_str: str) -> str:  # noqa: C901  # legacy internal helper; refactor in a dedicated PR
@@ -465,6 +676,25 @@ def _open_binary_stream(uri: Uri, mode: str, transport_params: TransportParams) 
     if not hasattr(fobj, "name"):
         fobj.name = uri
 
+    return fobj
+
+
+def _open_write_session_binary(uri: str, mode: str, transport_params: TransportParams) -> IO[bytes]:
+    """Open a transport-backed staged binary write stream."""
+    if mode != "wb":
+        msg = f"write sessions require write mode, got {mode!r}"
+        raise ValueError(msg)
+
+    scheme = _sniff_scheme(uri)
+    submodule = transport.get_transport(scheme)
+    if scheme in ("s3", "s3n", "s3a"):
+        params = dict(transport_params)
+        params["staged"] = True
+    else:
+        params = transport_params
+    fobj = submodule.open_write_session_uri(uri, mode, params)
+    if not hasattr(fobj, "name"):
+        fobj.name = uri
     return fobj
 
 

@@ -81,6 +81,11 @@ def open(..., mode, param1=None, param2=None, paramN=None):
 Have a look at the existing mechanisms to see how they work.
 You may define other functions and classes as necessary for your implementation.
 
+If the transport can stage writes without making the destination visible, set ``SUPPORTS_WRITE_SESSIONS = True``
+and expose ``open_write_session_uri(uri, "wb", transport_params)``.
+The returned binary stream must support ``finish()``, ``commit()`` and ``abort()``.
+Do not set this flag for transports that can only publish data incrementally or on close.
+
 Once your module is working, register it in the [smart_open.transport](smart_open/transport.py) submodule.
 The `register_transport()` function updates a mapping from schemes to the modules that implement functionality for them.
 

@@ -34,10 +34,21 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 from .compression import register_compressor  # noqa: E402  # logger setup precedes imports (see #474)
-from .smart_open_lib import open, parse_uri  # noqa: E402  # logger setup precedes imports (see #474)
+from .smart_open_lib import (  # noqa: E402  # logger setup precedes imports (see #474)
+    WriteSession,
+    open,
+    open_write_session,
+    parse_uri,
+    write_session,
+    write_session_open,
+)
 
 __all__ = [
+    "WriteSession",
     "open",
+    "open_write_session",
     "parse_uri",
     "register_compressor",
+    "write_session",
+    "write_session_open",
 ]

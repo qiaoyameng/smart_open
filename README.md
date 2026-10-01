@@ -386,6 +386,27 @@ fout = open(
 )
 ```
 
+### Explicit Write Sessions
+
+Some applications need to finish and validate output before making it visible. Pass ``write_session=True`` to
+get a staged stream with ``finish()``, ``commit()`` and ``abort()`` methods. ``finish()`` flushes text and
+compression wrappers completely before the transport is allowed to publish anything.
+
+Write sessions are currently implemented for local files and S3 multipart uploads; other transports reject the
+mode at open time. S3 single-part uploads do not provide a remote staging phase, so ``multipart_upload`` must
+remain enabled.
+
+```python
+with open("s3://bucket/key.gz", "wb", write_session=True) as fout:
+    fout.write(payload)
+    fout.finish()
+
+if validate_output():
+    fout.commit()
+else:
+    fout.abort()
+```
+
 ### Iterating Over an S3 Bucket's Contents
 
 Since going over all (or select) keys in an S3 bucket is a very common operation, there's also an extra function `smart_open.s3.iter_bucket()` that does this efficiently, **processing the bucket keys in parallel** (using multithreading):
