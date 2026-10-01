@@ -228,6 +228,33 @@ with open("azure://mycontainer/my_file.txt", "wb", transport_params=transport_pa
     fout.write(b"hello world")
 ```
 
+### Reading Multiple Objects as One Stream
+
+Use `open_many` (also available as `chain_open`) to read many objects lazily as one stream:
+
+```python
+from smart_open import open_many
+
+
+def objects():
+    yield "s3://bucket/part-0000"
+    yield "s3://bucket/part-0001"
+
+
+with open_many(objects(), "rt", encoding="utf-8") as fin:
+    first_line = fin.readline()
+    next_chunk = fin.read(1024)
+```
+
+Each object is opened only after the previous object reaches end-of-file. Empty objects are skipped.
+Text objects have independent decoders, so a damaged character at the end of one object cannot be
+completed by bytes from the next; open in `"rb"` mode when raw byte segments must be joined.
+`readline()` continues across an object boundary until it finds a newline or reaches the end.
+`read()` and `readline()` share one logical position, which `tell()` reports as decoded characters
+in text mode and bytes in binary mode. If opening an object fails, the raised `OpenManyError`
+contains `object_index`, `logical_offset`, and `uri`; closing the chain early never opens later
+objects.
+
 ### Compression Handling
 
 The top-level `compression` parameter controls compression/decompression behavior when reading and writing.

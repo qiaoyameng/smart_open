@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import io
 import locale
 import logging
 import os
@@ -30,7 +31,7 @@ import smart_open.utils as so_utils
 from smart_open import doctools, transport
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from typing_extensions import Self
 
@@ -39,6 +40,185 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENCODING = locale.getpreferredencoding(do_setlocale=False)
+
+
+class OpenManyError(Exception):
+    """Raised when an object in a chained read cannot be opened.
+
+    Args:
+        object_index: Zero-based index of the object that failed to open.
+        logical_offset: Position at which the object starts in the concatenated
+            stream, in bytes for binary mode and decoded characters for text
+            mode.
+        uri: URI of the object that failed to open.
+    """
+
+    def __init__(self, object_index: int, logical_offset: int, uri: Uri) -> None:
+        self.object_index = object_index
+        self.logical_offset = logical_offset
+        self.uri = uri
+        super().__init__(
+            f"failed to open object {object_index} at logical offset {logical_offset}: {uri!r}"
+        )
+
+
+ChainOpenError = OpenManyError
+
+
+class _ChainedReader(io.IOBase):
+    """Read a lazily opened sequence of file-like objects as one stream."""
+
+    def __init__(
+        self,
+        uris: Any,
+        mode: str,
+        open_kwargs: dict[str, Any],
+    ) -> None:
+        super().__init__()
+        self._uris = uris
+        self._mode = mode
+        self._open_kwargs = open_kwargs
+        self._text = "b" not in mode
+        self._current: IO[Any] | None = None
+        self._next_index = 0
+        self._boundary_offset = 0
+        self._current_offset = 0
+        self._position = 0
+
+    @property
+    def mode(self) -> str:
+        """Return the mode in which the chained stream was opened."""
+        return self._mode
+
+    def readable(self) -> bool:
+        """Return whether the stream was opened for reading."""
+        return True
+
+    def writable(self) -> bool:
+        """Chained streams are read-only."""
+        return False
+
+    def seekable(self) -> bool:
+        """Chained streams do not support seeking."""
+        return False
+
+    def tell(self) -> int:
+        """Return the number of bytes or characters returned to the caller."""
+        self._checkClosed()
+        return self._position
+
+    def read(self, size: int | None = -1) -> Any:
+        """Read and concatenate bytes or characters from consecutive objects."""
+        self._checkClosed()
+        if size is None or size < 0:
+            remaining = -1
+        elif size == 0:
+            return "" if self._text else b""
+        else:
+            remaining = size
+
+        chunks = []
+        while remaining:
+            if not self._ensure_current():
+                break
+
+            if self._current is None:
+                msg = "chained reader current object disappeared"
+                raise RuntimeError(msg)
+            chunk = self._current.read(remaining)
+            if chunk:
+                chunks.append(chunk)
+                chunk_size = len(chunk)
+                self._current_offset += chunk_size
+                self._position += chunk_size
+                if remaining > 0:
+                    remaining -= chunk_size
+                continue
+
+            self._close_current()
+
+        return ("" if self._text else b"").join(chunks)
+
+    def readline(self, size: int | None = -1) -> Any:
+        """Read one line, joining a line fragment split across objects."""
+        self._checkClosed()
+        if size is None or size < 0:
+            remaining = -1
+        elif size == 0:
+            return "" if self._text else b""
+        else:
+            remaining = size
+
+        chunks = []
+        while remaining:
+            if not self._ensure_current():
+                break
+
+            if self._current is None:
+                msg = "chained reader current object disappeared"
+                raise RuntimeError(msg)
+            chunk = self._current.readline(remaining)
+            if chunk:
+                chunks.append(chunk)
+                chunk_size = len(chunk)
+                self._current_offset += chunk_size
+                self._position += chunk_size
+                if remaining > 0:
+                    remaining -= chunk_size
+                if remaining == 0 or chunk.endswith(("\n", "\r")):
+                    break
+                continue
+
+            self._close_current()
+
+        return ("" if self._text else b"").join(chunks)
+
+    def close(self) -> None:
+        """Close the active object without opening any later objects."""
+        try:
+            self._close_current()
+        finally:
+            super().close()
+
+    def _ensure_current(self) -> bool:
+        while self._current is None:
+            try:
+                uri = next(self._uris)
+            except StopIteration:
+                return False
+
+            index = self._next_index
+            try:
+                current = open(uri, self._mode, **self._open_kwargs)
+            except Exception as exc:  # noqa: BLE001  # wrap every opener failure with chain position
+                error = OpenManyError(index, self._boundary_offset, uri)
+                self.close()
+                raise error from exc
+
+            self._current = current
+            self._next_index = index + 1
+            self._current_offset = 0
+        return True
+
+    def _close_current(self) -> None:
+        if self._current is None:
+            return
+        try:
+            self._current.close()
+        finally:
+            self._boundary_offset += self._current_offset
+            self._current = None
+            self._current_offset = 0
+
+
+def _validate_read_mode(mode: str) -> str:
+    if not isinstance(mode, str):
+        msg = "mode should be a string"
+        raise TypeError(msg)
+    if mode not in {"r", "rt", "tr", "rb", "br"}:
+        msg = "open_many only supports read modes 'r', 'rt', and 'rb'"
+        raise ValueError(msg)
+    return mode
 
 
 def _sniff_scheme(uri_as_string: str) -> str:
@@ -298,6 +478,139 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
                 setattr(decoded, attr, getattr(binary, attr))
 
     return cast("IO[Any]", so_utils.FileLikeProxy(decoded, binary))
+
+
+@overload
+def open_many(
+    uris: Iterable[Uri],
+    mode: Literal["r", "rt", "tr"] = ...,
+    buffering: int = ...,
+    encoding: str | None = ...,
+    errors: str | None = ...,
+    newline: str | None = ...,
+    closefd: bool = ...,  # noqa: FBT001  # public API
+    opener: Callable[[str, int], int] | None = ...,
+    compression: str = ...,
+    compression_kwargs: CompressionKwargs | None = ...,
+    transport_params: TransportParams | None = ...,
+) -> TextIO: ...
+
+
+@overload
+def open_many(
+    uris: Iterable[Uri],
+    mode: Literal["rb", "br"],
+    buffering: int = ...,
+    *,
+    encoding: None = ...,
+    errors: str | None = ...,
+    newline: str | None = ...,
+    closefd: bool = ...,  # noqa: FBT001  # public API
+    opener: Callable[[str, int], int] | None = ...,
+    compression: str = ...,
+    compression_kwargs: CompressionKwargs | None = ...,
+    transport_params: TransportParams | None = ...,
+) -> BinaryIO: ...
+
+
+@overload
+def open_many(
+    uris: Iterable[Uri],
+    mode: str = ...,
+    buffering: int = ...,
+    encoding: str | None = ...,
+    errors: str | None = ...,
+    newline: str | None = ...,
+    closefd: bool = ...,  # noqa: FBT001  # public API
+    opener: Callable[[str, int], int] | None = ...,
+    compression: str = ...,
+    compression_kwargs: CompressionKwargs | None = ...,
+    transport_params: TransportParams | None = ...,
+) -> IO[Any]: ...
+
+
+def open_many(  # noqa: PLR0913
+    uris: Iterable[Uri],
+    mode: str = "r",
+    buffering: int = -1,
+    encoding: str | None = None,
+    errors: str | None = None,
+    newline: str | None = None,
+    closefd: bool = True,  # noqa: FBT001, FBT002  # public API
+    opener: Callable[[str, int], int] | None = None,
+    compression: str = so_compression.INFER_FROM_EXTENSION,
+    compression_kwargs: CompressionKwargs | None = None,
+    transport_params: TransportParams | None = None,
+) -> IO[Any]:
+    r"""Open multiple readable objects as one lazy, sequential stream.
+
+    URIs are pulled from ``uris`` one at a time. A new object is opened only
+    after the previous object has returned end-of-file, so generators are a
+    natural way to provide long object listings. Empty objects are skipped
+    automatically.
+
+    Each object is opened independently by :func:`open`. In text mode this also
+    means each object gets its own decoder. A multibyte character split across
+    an object boundary is therefore invalid and cannot be completed using bytes
+    from the next object; use binary mode if such raw segments must be joined.
+
+    ``readline`` joins text that has no line terminator at the end of an object
+    with text from the next object. ``read`` and ``readline`` share one logical
+    position, and ``tell`` reports the number of decoded characters or bytes
+    already returned. Closing the chained stream closes only the active object
+    and never opens later objects.
+
+    Args:
+        uris: Iterable or lazy generator of objects to read.
+        mode: One of ``r``, ``rt``, or ``rb``.
+        buffering: Forwarded to :func:`open` for each object.
+        encoding: Forwarded to :func:`open` for each object.
+        errors: Forwarded to :func:`open` for each object.
+        newline: Forwarded to :func:`open` for each object.
+        closefd: Forwarded to :func:`open` for each object.
+        opener: Forwarded to :func:`open` for each object.
+        compression: Forwarded to :func:`open` for each object.
+        compression_kwargs: Forwarded to :func:`open` for each object.
+        transport_params: Forwarded to :func:`open` for each object.
+
+    Returns:
+        A readable, non-seekable file-like object.
+
+    Raises:
+        TypeError: If ``mode`` is not a string or ``uris`` is a single URI.
+        ValueError: If ``mode`` is not a supported read mode.
+        OpenManyError: If an object cannot be opened. Its ``object_index`` and
+            ``logical_offset`` attributes identify the failed boundary.
+    """
+    mode = _validate_read_mode(mode)
+    stream_mode = mode.replace("b", "") if encoding is not None else mode
+    if isinstance(uris, (str, bytes, pathlib.PurePath)):
+        msg = "uris must be an iterable of URIs, not a single URI"
+        raise TypeError(msg)
+    try:
+        uri_iter = iter(uris)
+    except TypeError as exc:
+        msg = "uris must be an iterable of URIs"
+        raise TypeError(msg) from exc
+
+    if transport_params is None:
+        transport_params = {}
+
+    open_kwargs = {
+        "buffering": buffering,
+        "encoding": encoding,
+        "errors": errors,
+        "newline": newline,
+        "closefd": closefd,
+        "opener": opener,
+        "compression": compression,
+        "compression_kwargs": compression_kwargs,
+        "transport_params": transport_params,
+    }
+    return cast("IO[Any]", _ChainedReader(uri_iter, stream_mode, open_kwargs))
+
+
+chain_open = open_many
 
 
 def _get_binary_mode(mode_str: str) -> str:  # noqa: C901  # legacy internal helper; refactor in a dedicated PR

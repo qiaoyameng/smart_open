@@ -34,10 +34,21 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
 from .compression import register_compressor  # noqa: E402  # logger setup precedes imports (see #474)
-from .smart_open_lib import open, parse_uri  # noqa: E402  # logger setup precedes imports (see #474)
+from .smart_open_lib import (  # noqa: E402  # logger setup precedes imports (see #474)
+    ChainOpenError,
+    OpenManyError,
+    chain_open,
+    open,
+    open_many,
+    parse_uri,
+)
 
 __all__ = [
     "open",
+    "chain_open",
+    "open_many",
     "parse_uri",
     "register_compressor",
+    "OpenManyError",
+    "ChainOpenError",
 ]
