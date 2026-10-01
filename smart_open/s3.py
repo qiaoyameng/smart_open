@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import functools
 import http
@@ -15,6 +16,7 @@ import io
 import itertools
 import logging
 import re
+import tempfile
 import time
 from collections.abc import Callable, Iterator
 from math import inf
@@ -1421,6 +1423,14 @@ def _accept_all(key: str) -> bool:  # noqa: ARG001  # interface conformance
     return True
 
 
+class KeyDownloadError(Exception):
+    """A bucket object could not be downloaded. The key is preserved on ``.key``."""
+
+    def __init__(self, key: str) -> None:
+        self.key = key
+        super().__init__(f"failed to download key {key!r}")
+
+
 def iter_bucket(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     bucket_name: str,
     prefix: str = "",
@@ -1431,6 +1441,8 @@ def iter_bucket(  # noqa: PLR0913  # legacy public API; refactor in a dedicated 
     max_threads_per_fileobj: int = 4,
     client_kwargs: dict[str, Any] | None = None,
     session_kwargs: dict[str, Any] | None = None,
+    ordered: bool = True,
+    max_buffered_bytes: int | None = 64 * 1024**2,
 ) -> Iterator[tuple[str, bytes]]:
     """Iterate and download all S3 objects under `s3://bucket_name/prefix`.
 
@@ -1455,6 +1467,17 @@ def iter_bucket(  # noqa: PLR0913  # legacy public API; refactor in a dedicated 
         session_kwargs: Keyword arguments to pass when creating a new session.
             For a list of available names and values, see:
             https://boto3.amazonaws.com/v1/documentation/api/latest/reference/core/session.html#boto3.session.Session
+        ordered: If True (default), results are yielded strictly in bucket
+            listing order: a slow object is never overtaken by later, faster
+            objects, while downloads still run in parallel. The total size of
+            objects that finished downloading but have not been yielded yet is
+            bounded by `max_buffered_bytes`. If False, use the legacy pipeline
+            without a byte budget.
+        max_buffered_bytes: Maximum total bytes of downloaded-but-not-yet-yielded
+            content held in memory when `ordered` is True. A single object larger
+            than this budget is streamed to a temporary file on local disk
+            (`tempfile.TemporaryFile`) and read back into memory upon delivery.
+            Set to None to disable the budget. Default: 64 MiB.
 
     Yields:
         Tuples of ``(key, content)``, where ``key`` is the full key name (does not
@@ -1462,6 +1485,9 @@ def iter_bucket(  # noqa: PLR0913  # legacy public API; refactor in a dedicated 
 
     Raises:
         ValueError: If bucket_name is None.
+        KeyDownloadError: If an object fails to download after all retries
+            (ordered mode only). The failed key is available on ``.key``, the
+            original exception on ``__cause__``.
 
     Note:
         The keys are processed in parallel, using `workers` threads (default: 16),
@@ -1530,29 +1556,194 @@ def iter_bucket(  # noqa: PLR0913  # legacy public API; refactor in a dedicated 
     # Limit the iterator ('infinite' iterators are supported, key_limit=None is supported)
     key_iterator = itertools.islice(key_iterator, key_limit)
 
-    with smart_open.concurrency.ThreadPoolExecutor(workers) as executor:
-        result_iterator = executor.imap(download_key, key_iterator)
-        for key_no, (key, content) in enumerate(result_iterator, start=1):
-            # Skip deleted objects (404 responses)
-            if key is None:
-                continue
+    if ordered:
+        context: Any = contextlib.nullcontext()
+        result_iterator = _iter_bucket_ordered(
+            client=client,
+            bucket_name=bucket_name,
+            key_iterator=key_iterator,
+            workers=workers,
+            retries=retries,
+            transfer_config=transfer_config,
+            max_buffered_bytes=max_buffered_bytes,
+        )
+    else:
+        context = smart_open.concurrency.ThreadPoolExecutor(workers)
+        result_iterator = context.imap(download_key, key_iterator)
 
-            if key_no % 1000 == 0:
-                logger.info(
-                    "yielding key #%i: %s, size %i (total %.1f MB)",
-                    key_no,
-                    key,
-                    len(content),
-                    total_size / 1024.0**2,
-                )
+    with context:
+        try:
+            for key_no, (key, content) in enumerate(result_iterator, start=1):
+                # Skip deleted objects (404 responses)
+                if key is None:
+                    continue
 
-            yield key, content
-            total_size += len(content)
+                if key_no % 1000 == 0:
+                    logger.info(
+                        "yielding key #%i: %s, size %i (total %.1f MB)",
+                        key_no,
+                        key,
+                        len(content),
+                        total_size / 1024.0**2,
+                    )
+
+                yield key, content
+                total_size += len(content)
+        finally:
+            # If the caller stops iterating early, propagate the close so the
+            # ordered pipeline cancels pending downloads and frees its buffers.
+            result_iterator.close()
     logger.info(
         "processed %i keys, total size %.1f MB",
         key_no,
         total_size / 1024.0**2,
     )
+
+
+def _iter_bucket_ordered(
+    *,
+    client: S3Client,
+    bucket_name: str,
+    key_iterator: Iterator[tuple[str, int]],
+    workers: int,
+    retries: int,
+    transfer_config: Any,
+    max_buffered_bytes: int | None,
+) -> Iterator[tuple[str, bytes]]:
+    """Drive an `_OrderedBucketDownloader` over `key_iterator`."""
+    downloader = _OrderedBucketDownloader(
+        client=client,
+        bucket_name=bucket_name,
+        workers=workers,
+        retries=retries,
+        transfer_config=transfer_config,
+        max_buffered_bytes=max_buffered_bytes,
+    )
+    try:
+        for key, size in key_iterator:
+            yield from downloader.wait_budget(size)
+            downloader.submit(key, size)
+            yield from downloader.pop_ready()
+        yield from downloader.drain()
+    finally:
+        downloader.close()
+
+
+class _PendingDownload:
+    """A submitted download and its not-yet-delivered buffer."""
+
+    __slots__ = ("key", "reserved", "buf", "future")
+
+    def __init__(self, key: str, reserved: int, buf: Any, future: Any) -> None:
+        self.key = key
+        self.reserved = reserved
+        self.buf = buf
+        self.future = future
+
+    def discard(self) -> None:
+        """Release the buffered data, if it hasn't been delivered yet."""
+        buf, self.buf = self.buf, None
+        if buf is not None:
+            buf.close()
+
+
+class _OrderedBucketDownloader:
+    """Download S3 objects concurrently and deliver them in listing order.
+
+    Bounds the total size of objects that finished downloading but have not
+    been delivered yet to `max_buffered_bytes`. Objects larger than the budget
+    are streamed to temporary files on local disk instead of being held in
+    memory. All budget bookkeeping happens on the consuming thread.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: S3Client,
+        bucket_name: str,
+        workers: int,
+        retries: int,
+        transfer_config: Any,
+        max_buffered_bytes: int | None,
+    ) -> None:
+        self._client = client
+        self._bucket_name = bucket_name
+        self._retries = retries
+        self._transfer_config = transfer_config
+        self._max_buffered_bytes = max_buffered_bytes if max_buffered_bytes is not None else inf
+        self._buffered_bytes = 0
+        self._pending: collections.deque[_PendingDownload] = collections.deque()
+        self._executor = smart_open.concurrency.ThreadPoolExecutor(workers)
+
+    def submit(self, key: str, size: int) -> None:
+        """Submit a key for download. Call `wait_budget` first."""
+        use_tempfile = size > self._max_buffered_bytes
+        if use_tempfile:
+            buf: Any = tempfile.TemporaryFile(prefix="smart-open-iter-bucket-")
+            reserved = 0
+        else:
+            buf = io.BytesIO()
+            reserved = size
+        future = self._executor.submit(
+            _download_key_into,
+            client=self._client,
+            bucket_name=self._bucket_name,
+            key_name=key,
+            retries=self._retries,
+            transfer_config=self._transfer_config,
+            fileobj=buf,
+            stream=use_tempfile,
+        )
+        self._pending.append(_PendingDownload(key, reserved, buf, future))
+        self._buffered_bytes += reserved
+
+    def wait_budget(self, size: int) -> Iterator[tuple[str, bytes]]:
+        """Yield deliverable results until there is budget for `size` more bytes."""
+        if size > self._max_buffered_bytes:
+            return  # spills to a temporary file, no budget needed
+        while self._pending and self._buffered_bytes + size > self._max_buffered_bytes:
+            result = self._pop_head()
+            if result is not None:
+                yield result
+
+    def pop_ready(self) -> Iterator[tuple[str, bytes]]:
+        """Yield results that finished downloading, in listing order."""
+        while self._pending and self._pending[0].future.done():
+            result = self._pop_head()
+            if result is not None:
+                yield result
+
+    def drain(self) -> Iterator[tuple[str, bytes]]:
+        """Yield all remaining results in listing order, blocking as needed."""
+        while self._pending:
+            result = self._pop_head()
+            if result is not None:
+                yield result
+
+    def close(self) -> None:
+        """Cancel not-yet-started downloads and release all buffered data."""
+        for slot in self._pending:
+            slot.future.cancel()
+            slot.discard()
+        self._pending.clear()
+        self._buffered_bytes = 0
+        self._executor.shutdown(wait=True)
+
+    def _pop_head(self) -> tuple[str, bytes] | None:
+        slot = self._pending.popleft()
+        return self._deliver(slot)
+
+    def _deliver(self, slot: _PendingDownload) -> tuple[str, bytes] | None:
+        downloaded = slot.future.result()
+        self._buffered_bytes -= slot.reserved
+        if not downloaded:
+            slot.discard()
+            return None
+        buf = slot.buf
+        buf.seek(0)
+        content = buf.read()
+        slot.discard()
+        return slot.key, content
 
 
 def _list_bucket(
@@ -1561,7 +1752,7 @@ def _list_bucket(
     client: S3Client,
     prefix: str = "",
     accept_key: Callable[[str], bool] = lambda k: True,  # noqa: ARG005  # interface conformance
-) -> Iterator[str]:
+) -> Iterator[tuple[str, int]]:
     ctoken: str | None = None
 
     while True:
@@ -1576,7 +1767,7 @@ def _list_bucket(
         for c in response.get("Contents", []):
             key = c["Key"]
             if accept_key(key):
-                yield key
+                yield key, c.get("Size", 0)
         ctoken = response.get("NextContinuationToken", None)
         if not ctoken:
             break
@@ -1616,6 +1807,54 @@ def _download_key(
             continue
         return key_name, content_bytes
     return None
+
+
+def _download_key_into(
+    *,
+    client: S3Client,
+    bucket_name: str,
+    key_name: str,
+    retries: int,
+    transfer_config: Any,
+    fileobj: Any,
+    stream: bool,
+) -> bool:
+    """Download a key into `fileobj`, retrying transient failures.
+
+    Returns False if the object was deleted (404) between listing and
+    download. Raises `KeyDownloadError` (chained to the original error, with
+    the key preserved) once all retries are exhausted.
+    """
+    for attempt in range(retries + 1):
+        try:
+            if stream:
+                client.download_fileobj(
+                    Bucket=bucket_name,
+                    Key=key_name,
+                    Fileobj=fileobj,
+                    Config=transfer_config,
+                )
+            else:
+                fileobj.write(
+                    _download_fileobj(
+                        client=client,
+                        bucket_name=bucket_name,
+                        key_name=key_name,
+                        transfer_config=transfer_config,
+                    )
+                )
+        except botocore.exceptions.ClientError as err:
+            # See _download_key for why 404s are skipped.
+            if "Error" in err.response and err.response["Error"].get("Code") == "404":
+                return False
+            if attempt == retries:
+                raise KeyDownloadError(key_name) from err
+            # Drop any partially downloaded data before retrying.
+            fileobj.seek(0)
+            fileobj.truncate(0)
+            continue
+        return True
+    return False  # pragma: no cover
 
 
 def _download_fileobj(

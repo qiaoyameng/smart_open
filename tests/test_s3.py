@@ -13,6 +13,7 @@ import random
 import re
 import sys
 import tempfile
+import time
 import unittest
 import warnings
 from collections import defaultdict
@@ -1068,9 +1069,18 @@ class IterBucketTest(unittest.TestCase):
         populate_bucket()
         with (
             mock.patch("smart_open.s3._download_fileobj", side_effect=ARBITRARY_CLIENT_ERROR),
-            pytest.raises(botocore.exceptions.ClientError),
+            pytest.raises(smart_open.s3.KeyDownloadError),
         ):
             list(smart_open.s3.iter_bucket(BUCKET_NAME))
+
+    def test_iter_bucket_non_404_unordered(self):
+        """Iter bucket non 404, legacy pipeline."""
+        populate_bucket()
+        with (
+            mock.patch("smart_open.s3._download_fileobj", side_effect=ARBITRARY_CLIENT_ERROR),
+            pytest.raises(botocore.exceptions.ClientError),
+        ):
+            list(smart_open.s3.iter_bucket(BUCKET_NAME, ordered=False))
 
     def test_accepts_boto3_bucket(self):
         """Accepts boto3 bucket."""
@@ -1089,7 +1099,7 @@ class IterBucketTest(unittest.TestCase):
         assert len(keys) == num_keys
 
         expected = [f"key_{x}" for x in range(num_keys)]
-        assert sorted(keys) == sorted(expected)
+        assert sorted(key for key, _size in keys) == sorted(expected)
 
     def test_list_bucket_long(self):
         """List bucket long."""
@@ -1101,7 +1111,126 @@ class IterBucketTest(unittest.TestCase):
         assert len(keys) == num_keys
 
         expected = [f"key_{x}" for x in range(num_keys)]
-        assert sorted(keys) == sorted(expected)
+        assert sorted(key for key, _size in keys) == sorted(expected)
+
+
+@mock_s3
+class IterBucketOrderedTest(unittest.TestCase):
+    """Tests for the ordered, byte-budgeted iter_bucket pipeline."""
+
+    def setUp(self):
+        """SetUp."""
+        ignore_resource_warnings()
+        s3 = _resource("s3")
+        s3.create_bucket(Bucket=BUCKET_NAME).wait_until_exists()
+        self.client = s3.meta.client
+
+    def _put(self, key, body):
+        self.client.put_object(Bucket=BUCKET_NAME, Key=key, Body=body)
+
+    def test_order_and_buffer_peak_with_slow_first_key(self):
+        """A slow first object is not overtaken, and the byte budget caps the cache."""
+        num_keys = 8
+        keys = [f"key_{i:03d}" for i in range(num_keys)]
+        follower_size = 1024 * 1024
+        bodies = {keys[0]: b"s" * 128}
+        for key in keys[1:]:
+            bodies[key] = os.urandom(follower_size)
+        for key, body in bodies.items():
+            self._put(key, body)
+
+        real_download = smart_open.s3._download_fileobj
+
+        def slow_first_download(**kwargs):
+            if kwargs["key_name"] == keys[0]:
+                time.sleep(0.5)
+            return real_download(**kwargs)
+
+        real_downloader = smart_open.s3._OrderedBucketDownloader
+        peaks = []
+
+        class ProbingDownloader(real_downloader):
+            def submit(self, key, size):
+                super().submit(key, size)
+                peaks.append(self._buffered_bytes)  # test reaches into private state
+
+        max_buffered = 2 * follower_size
+        with (
+            mock.patch("smart_open.s3._download_fileobj", side_effect=slow_first_download),
+            mock.patch("smart_open.s3._OrderedBucketDownloader", ProbingDownloader),
+        ):
+            results = list(
+                smart_open.s3.iter_bucket(BUCKET_NAME, workers=4, max_buffered_bytes=max_buffered)
+            )
+
+        # listing order is preserved even though key_000 finished last
+        assert [key for key, _content in results] == keys
+        for key, content in results:
+            assert content == bodies[key]
+
+        # the byte budget bounded the cache, not just the number of futures:
+        # without it, all 7 x 1 MiB followers could buffer behind the slow key
+        assert peaks, "expected the ordered downloader to be used"
+        assert max(peaks) <= max_buffered
+        assert max(peaks) < (num_keys - 1) * follower_size
+
+    def test_large_object_uses_temporary_file(self):
+        """An object larger than the budget spills to a temporary file."""
+        big = os.urandom(64 * 1024)
+        small = b"a" * 100
+        self._put("key_000", big)
+        self._put("key_001", small)
+
+        with mock.patch(
+            "smart_open.s3.tempfile.TemporaryFile", wraps=tempfile.TemporaryFile
+        ) as temporary_file:
+            results = list(smart_open.s3.iter_bucket(BUCKET_NAME, workers=2, max_buffered_bytes=1024))
+
+        assert temporary_file.call_count == 1
+        assert [key for key, _content in results] == ["key_000", "key_001"]
+        assert dict(results) == {"key_000": big, "key_001": small}
+
+    def test_early_close_cancels_pending_downloads(self):
+        """Closing the iterator early cancels unstarted downloads."""
+        num_keys = 20
+        for i in range(num_keys):
+            self._put(f"key_{i:03d}", os.urandom(16 * 1024))
+
+        started = []
+        real_download = smart_open.s3._download_fileobj
+
+        def recording_download(**kwargs):
+            started.append(kwargs["key_name"])
+            return real_download(**kwargs)
+
+        with mock.patch("smart_open.s3._download_fileobj", side_effect=recording_download):
+            iterator = smart_open.s3.iter_bucket(BUCKET_NAME, workers=4, max_buffered_bytes=32 * 1024)
+            key, _content = next(iterator)
+            assert key == "key_000"
+            iterator.close()
+            time.sleep(0.5)
+
+        # unstarted work was cancelled instead of draining all 20 keys
+        assert 0 < len(started) < num_keys
+
+    def test_download_error_preserves_key_name(self):
+        """A failed download raises KeyDownloadError carrying the key."""
+        populate_bucket()
+        real_download = smart_open.s3._download_fileobj
+
+        def fail_key_4(**kwargs):
+            if kwargs["key_name"] == "key_4":
+                raise ARBITRARY_CLIENT_ERROR
+            return real_download(**kwargs)
+
+        with (
+            mock.patch("smart_open.s3._download_fileobj", side_effect=fail_key_4),
+            pytest.raises(smart_open.s3.KeyDownloadError) as excinfo,
+        ):
+            list(smart_open.s3.iter_bucket(BUCKET_NAME))
+
+        assert excinfo.value.key == "key_4"
+        assert isinstance(excinfo.value.__cause__, botocore.exceptions.ClientError)
 
 
 #
