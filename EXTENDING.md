@@ -114,6 +114,26 @@ This documentation gets parsed by the `doctools` module and appears in various d
 
 Some of these differences are by design; others as a consequence of evolution.
 
+### Explicit write sessions
+
+Write sessions are an optional transport capability, not a universal backend guarantee.
+A transport that can keep data staged while keeping the destination hidden may set:
+
+```python
+SUPPORTS_WRITE_SESSION = True
+```
+
+Its `open_uri()` must accept `write_session=True` for `"wb"` and return a binary stream with:
+
+- `finish()`: flush and close transport-local staging buffers without publishing the destination;
+- `commit()`: finish if necessary, then publish the completed destination;
+- `abort()`: discard staged data and release resources.
+
+Closing or leaving a top-level session context without committing must discard unresolved staged data.
+
+Transports without safe staging should leave the flag unset.  The top-level API rejects that mode while opening,
+before creating a destination object.
+
 ## New compression mechanisms
 
 The compression layer is self-contained in the `smart_open.compression` submodule.

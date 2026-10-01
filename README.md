@@ -228,6 +228,30 @@ with open("azure://mycontainer/my_file.txt", "wb", transport_params=transport_pa
     fout.write(b"hello world")
 ```
 
+### Explicit Write Sessions
+
+Ordinary writes publish the destination when the file object is closed.  For validation workflows where the final
+decision comes after writing, use `open_write_session()` (or `open(..., write_session=True)`):
+
+```python
+from smart_open import open_write_session
+
+session = open_write_session("s3://bucket/object.gz")
+session.write(b"temporary content")
+session.finish()  # flush text encoding and compression, but keep the object hidden
+
+if validate():
+    session.commit()  # publish the completed object
+else:
+    session.abort()  # discard the staged upload
+```
+
+The operations are explicit and idempotent: calling `finish()` repeatedly is safe, `commit()` finishes when needed,
+and a committed or aborted session cannot switch to the opposite terminal state.  Support is transport-specific.
+Local files stage in a same-directory temporary file, and S3 supports sessions only with multipart uploads; transports
+without staging support reject the mode while opening.  Closing an unresolved session (including normal context exit)
+discards it; call `commit()` explicitly to publish the result.
+
 ### Compression Handling
 
 The top-level `compression` parameter controls compression/decompression behavior when reading and writing.

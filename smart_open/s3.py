@@ -75,6 +75,7 @@ MAX_PART_SIZE = 5 * 1024**3
 """The absolute maximum permitted by Amazon."""
 
 SCHEMES = ("s3", "s3n", "s3a")
+SUPPORTS_WRITE_SESSION = True
 
 DEFAULT_BUFFER_SIZE = 128 * 1024
 
@@ -299,11 +300,26 @@ def _consolidate_params(uri: _S3Uri, transport_params: TransportParams) -> tuple
     return uri, transport_params
 
 
-def open_uri(uri: str, mode: str, transport_params: TransportParams) -> io.BufferedIOBase:
+def open_uri(
+    uri: str,
+    mode: str,
+    transport_params: TransportParams,
+    *,
+    write_session: bool = False,
+) -> io.BufferedIOBase:
     """Open an S3 URI using the given mode and transport params."""
     parsed_uri = parse_uri(uri)
     parsed_uri, transport_params = _consolidate_params(parsed_uri, transport_params)
+    write_session = write_session or bool(transport_params.get("write_session", False))
     kwargs = smart_open.utils.check_kwargs(open, transport_params)
+    if write_session:
+        return open(
+            parsed_uri["bucket_id"],
+            parsed_uri["key_id"],
+            mode,
+            write_session=True,
+            **kwargs,
+        )
     return open(parsed_uri["bucket_id"], parsed_uri["key_id"], mode, **kwargs)
 
 
@@ -320,6 +336,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     client_kwargs: dict[str, Any] | None = None,
     writebuffer: io.BytesIO | None = None,
     range_chunk_size: int | None = None,
+    write_session: bool = False,  # noqa: FBT001, FBT002  # public API
 ) -> io.BufferedIOBase:
     """Open an S3 object for reading or writing.
 
@@ -386,6 +403,9 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             request. Values larger than the file size result in a single GET for the
             whole file. Affects reading only. Does not affect memory usage
             (controlled by buffer_size).
+        write_session: Require an explicit staged write session. Only multipart
+            uploads support this mode; single-part uploads are rejected while
+            opening because they cannot be abandoned safely.
 
     Returns:
         A file-like object for reading or writing.
@@ -416,6 +436,9 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             range_chunk_size=range_chunk_size,
         )
     elif mode == constants.WRITE_BINARY:
+        if write_session and not multipart_upload:
+            msg = "S3 write sessions require multipart_upload=True"
+            raise io.UnsupportedOperation(msg)
         if multipart_upload:
             fileobj = MultipartWriter(
                 bucket_id,
@@ -424,6 +447,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
                 client_kwargs=client_kwargs,
                 writebuffer=writebuffer,
                 part_size=min_part_size,
+                write_session=write_session,
             )
         else:
             fileobj = SinglepartWriter(
@@ -1024,6 +1048,7 @@ class MultipartWriter(io.BufferedIOBase):
         client: S3Client | None = None,
         client_kwargs: dict[str, Any] | None = None,
         writebuffer: io.BytesIO | None = None,
+        write_session: bool = False,  # noqa: FBT001, FBT002  # public API
     ) -> None:
         adjusted_ps = smart_open.utils.clamp(part_size, MIN_PART_SIZE, MAX_PART_SIZE)
         if part_size != adjusted_ps:
@@ -1052,6 +1077,8 @@ class MultipartWriter(io.BufferedIOBase):
         self._total_bytes = 0
         self._total_parts = 0
         self._parts: list[dict[str, Any]] = []
+        self._state = "active"
+        self._write_session = write_session
 
     def flush(self) -> None:
         """No-op flush; data is buffered until ``close`` or ``_upload_next_part``."""
@@ -1062,14 +1089,35 @@ class MultipartWriter(io.BufferedIOBase):
     def close(self) -> None:
         """Complete the multipart upload (or abort) and close the stream."""
         logger.debug("close: called")
-        if self.closed:
+        if self._state == "aborted":
             return
+        if self._write_session:
+            self.finish()
+        else:
+            self.commit()
 
+    def finish(self) -> None:
+        """Upload buffered bytes without completing the multipart upload."""
+        if self._state != "active":
+            return
         if self._buf.tell():
             self._upload_next_part()
+        self._state = "finished"
+
+    def commit(self) -> None:
+        """Complete the multipart upload and make the object visible."""
+        if self._state == "committed":
+            return
+        if self._state == "aborted":
+            msg = "cannot commit an aborted multipart upload"
+            raise ValueError(msg)
+
+        self.finish()
+        if not self._upload_id:
+            return
 
         logger.debug("%s: completing multipart upload", self)
-        if self._total_bytes and self._upload_id:
+        if self._total_bytes:
             partial = functools.partial(
                 self._client.complete_multipart_upload,
                 Bucket=self._bucket,
@@ -1079,13 +1127,11 @@ class MultipartWriter(io.BufferedIOBase):
             )
             RETRY._do(partial)  # noqa: SLF001  # intra-package coupling
             logger.debug("%s: completed multipart upload", self)
-        elif self._upload_id:
+        else:
             #
-            # AWS complains with "The XML you provided was not well-formed or
-            # did not validate against our published schema" when the input is
-            # completely empty => abort the upload, no file created.
-            #
-            # We work around this by creating an empty file explicitly.
+            # AWS rejects an empty multipart completion. Abort it and create
+            # the empty object explicitly, preserving historical close()
+            # behavior.
             #
             self._client.abort_multipart_upload(
                 Bucket=self._bucket,
@@ -1099,6 +1145,18 @@ class MultipartWriter(io.BufferedIOBase):
             )
             logger.debug("%s: wrote 0 bytes to imitate multipart upload", self)
         self._upload_id = None
+        self._state = "committed"
+
+    def abort(self) -> None:
+        """Cancel the multipart upload and discard all staged parts."""
+        if self._state == "aborted":
+            return
+        if self._state == "committed":
+            msg = "cannot abort a committed multipart upload"
+            raise ValueError(msg)
+
+        self.terminate()
+        self._state = "aborted"
 
     @property
     def closed(self) -> bool:
@@ -1107,7 +1165,7 @@ class MultipartWriter(io.BufferedIOBase):
 
     def writable(self) -> bool:
         """Return True if the stream supports writing."""
-        return True
+        return self._state == "active"
 
     def seekable(self) -> bool:
         """Return True; we support `tell` but not `seek` or `truncate`."""
@@ -1143,8 +1201,14 @@ class MultipartWriter(io.BufferedIOBase):
         There's buffering happening under the covers, so this may not actually
         do any HTTP transfer right away.
         """
-        offset = 0
         mv = memoryview(b)
+        if self._state == "aborted":
+            return len(mv)
+        if self._state != "active":
+            msg = f"cannot write to multipart upload in {self._state!r} state"
+            raise ValueError(msg)
+
+        offset = 0
         self._total_bytes += len(mv)
 
         #
@@ -1171,7 +1235,7 @@ class MultipartWriter(io.BufferedIOBase):
     def terminate(self) -> None:
         """Cancel the underlying multipart upload."""
         upload_id = self._upload_id
-        if upload_id is None:
+        if upload_id is None or self._state == "aborted":
             return
         logger.debug("%s: terminating multipart upload", self)
         self._client.abort_multipart_upload(
@@ -1180,6 +1244,7 @@ class MultipartWriter(io.BufferedIOBase):
             UploadId=upload_id,
         )
         self._upload_id = None
+        self._state = "aborted"
         logger.debug("%s: terminated multipart upload", self)
 
     def to_boto3(self, resource: Any) -> Any:
@@ -1247,11 +1312,11 @@ class MultipartWriter(io.BufferedIOBase):
         exc_val: BaseException | None,
         exc_tb: TracebackType | None,
     ) -> None:
-        """Close or terminate the multipart writer on context exit."""
-        if exc_type is not None:
-            self.terminate()
-        else:
-            self.close()
+        """Commit ordinary writers on success; explicit sessions abort unless committed."""
+        if exc_type is not None or (self._write_session and self._state != "committed"):
+            self.abort()
+        elif self._state != "committed":
+            self.commit()
 
     def __str__(self) -> str:
         """Return a short human-readable description of the writer."""

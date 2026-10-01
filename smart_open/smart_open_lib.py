@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import io
 import locale
 import logging
 import os
@@ -28,6 +29,7 @@ import smart_open.compression as so_compression
 import smart_open.local_file as so_file
 import smart_open.utils as so_utils
 from smart_open import doctools, transport
+from smart_open.write_session import WriteSession
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -97,6 +99,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    write_session: bool = ...,
 ) -> TextIO: ...
 
 
@@ -114,6 +117,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    write_session: bool = ...,
 ) -> BinaryIO: ...
 
 
@@ -130,6 +134,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    write_session: bool = ...,
 ) -> IO[Any]: ...
 
 
@@ -145,6 +150,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     compression: str = so_compression.INFER_FROM_EXTENSION,
     compression_kwargs: CompressionKwargs | None = None,
     transport_params: TransportParams | None = None,
+    write_session: bool = False,  # noqa: FBT001, FBT002  # public API
 ) -> IO[Any]:
     r"""Open the URI object, returning a file-like object.
 
@@ -178,6 +184,10 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             compressor.
         transport_params: Additional parameters for the transport layer (see
             notes below).
+        write_session: Return an explicit staged write session when true.
+            ``finish()`` flushes text/compression layers, ``commit()`` makes
+            the destination visible, and ``abort()`` discards staged data.
+            Only transports that explicitly support staging accept this mode.
 
     Returns:
         A file-like object.
@@ -215,6 +225,17 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
 
     if transport_params is None:
         transport_params = {}
+    else:
+        transport_params = dict(transport_params)
+    write_session = write_session or bool(transport_params.pop("write_session", False))
+
+    if write_session:
+        if _get_binary_mode(mode) != "wb":
+            msg = "write sessions require write mode"
+            raise ValueError(msg)
+        if not isinstance(uri, (str, pathlib.Path)):
+            msg = "write sessions require a URI"
+            raise io.UnsupportedOperation(msg)
 
     fobj = _shortcut_open(
         uri,
@@ -224,6 +245,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         encoding=encoding,
         errors=errors,
         newline=newline,
+        write_session=write_session,
     )
     if fobj is not None:
         return fobj
@@ -263,7 +285,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     except ValueError as ve:
         raise NotImplementedError(ve.args[0]) from ve
 
-    binary = _open_binary_stream(uri, binary_mode, transport_params)
+    binary = _open_binary_stream(uri, binary_mode, transport_params, write_session=write_session)
     name = getattr(binary, "name", None)
     # prefer the stream's own name; if it's not string-like (e.g. ftp socket fileno), fall back to uri
     filename = name if isinstance(name, str) else uri if isinstance(uri, str) else None
@@ -297,7 +319,37 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             with contextlib.suppress(AttributeError):
                 setattr(decoded, attr, getattr(binary, attr))
 
+    if write_session:
+        return cast("IO[Any]", WriteSession(decoded, binary))
+
     return cast("IO[Any]", so_utils.FileLikeProxy(decoded, binary))
+
+
+def open_write_session(
+    uri: Uri,
+    mode: str = "wb",
+    *,
+    buffering: int = -1,
+    encoding: str | None = None,
+    errors: str | None = None,
+    newline: str | None = None,
+    compression: str = so_compression.INFER_FROM_EXTENSION,
+    compression_kwargs: CompressionKwargs | None = None,
+    transport_params: TransportParams | None = None,
+) -> WriteSession:
+    """Open a staged write session, returning an object with finish/commit/abort."""
+    return open(
+        uri,
+        mode,
+        buffering=buffering,
+        encoding=encoding,
+        errors=errors,
+        newline=newline,
+        compression=compression,
+        compression_kwargs=compression_kwargs,
+        transport_params=transport_params,
+        write_session=True,
+    )
 
 
 def _get_binary_mode(mode_str: str) -> str:  # noqa: C901  # legacy internal helper; refactor in a dedicated PR
@@ -363,6 +415,7 @@ def _shortcut_open(  # noqa: PLR0913  # legacy internal helper; refactor in a de
     encoding: str | None = None,
     errors: str | None = None,
     newline: str | None = None,
+    write_session: bool = False,
 ) -> IO[Any] | None:
     """Try to open the URI using the standard library io.open function.
 
@@ -389,6 +442,8 @@ def _shortcut_open(  # noqa: PLR0913  # legacy internal helper; refactor in a de
     Returns:
         The opened file, or None if no shortcut is possible.
     """
+    if write_session:
+        return None
     if not isinstance(uri, str):
         return None
 
@@ -420,7 +475,13 @@ def _shortcut_open(  # noqa: PLR0913  # legacy internal helper; refactor in a de
     return _builtin_open(local_path, mode, buffering=buffering, **open_kwargs)
 
 
-def _open_binary_stream(uri: Uri, mode: str, transport_params: TransportParams) -> IO[bytes]:
+def _open_binary_stream(
+    uri: Uri,
+    mode: str,
+    transport_params: TransportParams,
+    *,
+    write_session: bool = False,
+) -> IO[bytes]:
     """Open an arbitrary URI in the specified binary mode.
 
     Not all modes are supported for all protocols.
@@ -461,7 +522,13 @@ def _open_binary_stream(uri: Uri, mode: str, transport_params: TransportParams) 
 
     scheme = _sniff_scheme(uri)
     submodule = transport.get_transport(scheme)
-    fobj = submodule.open_uri(uri, mode, transport_params)
+    if write_session and not getattr(submodule, "SUPPORTS_WRITE_SESSION", False):
+        msg = f"transport {scheme!r} does not support explicit write sessions"
+        raise io.UnsupportedOperation(msg)
+    if write_session:
+        fobj = submodule.open_uri(uri, mode, transport_params, write_session=True)
+    else:
+        fobj = submodule.open_uri(uri, mode, transport_params)
     if not hasattr(fobj, "name"):
         fobj.name = uri
 
