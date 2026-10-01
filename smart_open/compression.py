@@ -89,21 +89,33 @@ def _maybe_wrap_buffered(file_obj: Any, mode: str) -> IO[bytes]:
     return result
 
 
-def _handle_bz2(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
+def _handle_bz2(file_obj: IO[bytes], mode: str, reproducible: bool = False, **kwargs: Any) -> IO[Any]:
+    # bz2 streams carry no filename/timestamp metadata, so they are already reproducible.
     import bz2
 
     result = bz2.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
     return _maybe_wrap_buffered(result, mode)
 
 
-def _handle_gzip(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
+def _handle_gzip(file_obj: IO[bytes], mode: str, reproducible: bool = False, **kwargs: Any) -> IO[Any]:
     import gzip
 
-    result = gzip.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
+    if reproducible:
+        #
+        # Produce deterministic output: pin the gzip header metadata (empty
+        # filename, zero mtime) and default to an explicit compression level,
+        # so identical input bytes always yield identical compressed bytes.
+        # gzip.open() does not accept mtime, so use GzipFile directly.
+        #
+        kwargs.setdefault("compresslevel", 9)
+        result = gzip.GzipFile(filename="", mode=mode, fileobj=file_obj, mtime=0, **kwargs)
+    else:
+        result = gzip.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
     return _maybe_wrap_buffered(result, mode)
 
 
-def _handle_zstd(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
+def _handle_zstd(file_obj: IO[bytes], mode: str, reproducible: bool = False, **kwargs: Any) -> IO[Any]:
+    # zstd frames carry no filename/timestamp metadata, so they are already reproducible.
     import sys
 
     if sys.version_info >= (3, 14):
@@ -116,14 +128,16 @@ def _handle_zstd(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
     return _maybe_wrap_buffered(result, mode)
 
 
-def _handle_xz(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
+def _handle_xz(file_obj: IO[bytes], mode: str, reproducible: bool = False, **kwargs: Any) -> IO[Any]:
+    # xz streams carry no filename/timestamp metadata, so they are already reproducible.
     import lzma
 
     result = lzma.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
     return _maybe_wrap_buffered(result, mode)
 
 
-def _handle_lz4(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
+def _handle_lz4(file_obj: IO[bytes], mode: str, reproducible: bool = False, **kwargs: Any) -> IO[Any]:
+    # lz4 frames carry no filename/timestamp metadata, so they are already reproducible.
     import lz4.frame
 
     result = lz4.frame.open(file_obj, mode=mode, **kwargs)

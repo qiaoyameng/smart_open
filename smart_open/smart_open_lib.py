@@ -97,6 +97,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    reproducible: bool = ...,
 ) -> TextIO: ...
 
 
@@ -114,6 +115,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    reproducible: bool = ...,
 ) -> BinaryIO: ...
 
 
@@ -130,6 +132,7 @@ def open(
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
     transport_params: TransportParams | None = ...,
+    reproducible: bool = ...,
 ) -> IO[Any]: ...
 
 
@@ -145,6 +148,7 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     compression: str = so_compression.INFER_FROM_EXTENSION,
     compression_kwargs: CompressionKwargs | None = None,
     transport_params: TransportParams | None = None,
+    reproducible: bool = False,  # noqa: FBT001, FBT002  # public API
 ) -> IO[Any]:
     r"""Open the URI object, returning a file-like object.
 
@@ -178,6 +182,17 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             compressor.
         transport_params: Additional parameters for the transport layer (see
             notes below).
+        reproducible: If True, produce deterministic output: identical input
+            always yields identical compressed bytes, so the result is safe for
+            content-addressed storage. For .gz, this pins the header metadata
+            (empty filename, zero modification time) and uses an explicit
+            compression level (9 unless overridden via ``compression_kwargs``);
+            the other supported formats carry no such metadata and are already
+            deterministic. In text mode, the encoding defaults to 'utf-8'
+            (instead of the locale-dependent default) and, when writing, the
+            newline defaults to '\n' (instead of the platform-dependent
+            default); pass ``encoding``/``newline`` explicitly to override.
+            Default: False (the previous, non-deterministic gzip behavior).
 
     Returns:
         A file-like object.
@@ -216,6 +231,9 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     if transport_params is None:
         transport_params = {}
 
+    if reproducible:
+        compression_kwargs = {"reproducible": True, **(compression_kwargs or {})}
+
     fobj = _shortcut_open(
         uri,
         mode,
@@ -243,7 +261,16 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         uri = str(uri)
 
     explicit_encoding = encoding
-    encoding = explicit_encoding or DEFAULT_ENCODING
+    if reproducible:
+        #
+        # Deterministic output requires text-mode defaults that depend neither
+        # on the locale (encoding) nor on the platform (newline translation).
+        #
+        encoding = explicit_encoding or "utf-8"
+        if newline is None and ("w" in mode or "a" in mode):
+            newline = "\n"
+    else:
+        encoding = explicit_encoding or DEFAULT_ENCODING
 
     #
     # This is how we get from the filename to the end result.  Decompression is

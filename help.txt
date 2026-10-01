@@ -37,7 +37,7 @@ PACKAGE CONTENTS
     webhdfs
 
 FUNCTIONS
-    open(uri: 'Uri', mode: 'str' = 'r', buffering: 'int' = -1, encoding: 'str | None' = None, errors: 'str | None' = None, newline: 'str | None' = None, closefd: 'bool' = True, opener: 'Callable[[str, int], int] | None' = None, compression: 'str' = 'infer_from_extension', compression_kwargs: 'CompressionKwargs | None' = None, transport_params: 'TransportParams | None' = None) -> 'IO[Any]'
+    open(uri: 'Uri', mode: 'str' = 'r', buffering: 'int' = -1, encoding: 'str | None' = None, errors: 'str | None' = None, newline: 'str | None' = None, closefd: 'bool' = True, opener: 'Callable[[str, int], int] | None' = None, compression: 'str' = 'infer_from_extension', compression_kwargs: 'CompressionKwargs | None' = None, transport_params: 'TransportParams | None' = None, reproducible: 'bool' = False) -> 'IO[Any]'
         Open the URI object, returning a file-like object.
 
         The URI is usually a string in a variety of formats.
@@ -70,6 +70,17 @@ FUNCTIONS
                 compressor.
             transport_params: Additional parameters for the transport layer (see
                 notes below).
+            reproducible: If True, produce deterministic output: identical input
+                always yields identical compressed bytes, so the result is safe for
+                content-addressed storage. For .gz, this pins the header metadata
+                (empty filename, zero modification time) and uses an explicit
+                compression level (9 unless overridden via ``compression_kwargs``);
+                the other supported formats carry no such metadata and are already
+                deterministic. In text mode, the encoding defaults to 'utf-8'
+                (instead of the locale-dependent default) and, when writing, the
+                newline defaults to '\n' (instead of the platform-dependent
+                default); pass ``encoding``/``newline`` explicitly to override.
+                Default: False (the previous, non-deterministic gzip behavior).
 
         Returns:
             A file-like object.
