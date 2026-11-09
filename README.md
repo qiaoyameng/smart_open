@@ -290,6 +290,40 @@ The dict is forwarded as-is; spell each option using the underlying library's
 own kwarg name (`compresslevel` for gzip/bz2, `preset` for xz, `level` for zstd,
 `compression_level` for lz4).
 
+#### Repeated random access into local gzip files
+
+A normal `seek()` on a gzip stream re-decompresses everything from the start
+of the compressed file on every backwards jump. For workloads that repeatedly
+sample the same local `.gz` file, opt into a session-only decompression
+checkpoint index via `indexed_seek=True`. Each checkpoint stores the zlib
+decompressor state plus the compressed bytes read ahead but not yet consumed,
+so backwards seeks resume from the nearest retained checkpoint instead of the
+beginning of the file:
+
+```python
+with open(
+    'sample.gz',
+    'rb',
+    compression_kwargs={
+        'indexed_seek': True,
+        'index_interval': 1 << 20,      # one checkpoint per ~1 MiB output
+        'max_checkpoints': 32,         # hard cap; oldest checkpoints are evicted
+    },
+) as fin:
+    fin.seek(10_000_000)
+    _ = fin.read(4096)
+    fin.seek(2_000_000)                # resumes from a checkpoint, no full re-decompress
+```
+
+The index is kept in memory for the lifetime of this open only: it never
+caches the decompressed payload, never writes an index file, and its total
+size is bounded by `max_checkpoints` regardless of the file length. The mode
+is limited to binary, seekable, local regular files opened for reading; other
+compression formats and non-seekable streams raise `ValueError` when
+`indexed_seek=True` is requested. The gzip member CRC and length checks still
+run exactly as in the standard library, including across concatenated and
+empty members.
+
 You can also easily add support for other file extensions and compression formats.
 For example, to open xz-compressed files:
 

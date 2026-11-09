@@ -99,6 +99,15 @@ def _handle_bz2(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
 def _handle_gzip(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
     import gzip
 
+    indexed_seek = kwargs.pop("indexed_seek", False)
+    if indexed_seek:
+        from smart_open.gzip_index import open_indexed_gzip
+
+        if not mode.startswith("r"):
+            msg = "indexed gzip mode is only supported for reading"
+            raise ValueError(msg)
+        return open_indexed_gzip(file_obj, **kwargs)
+
     result = gzip.open(filename=file_obj, mode=mode, **kwargs)  # noqa: SIM115  # returns the file object to caller
     return _maybe_wrap_buffered(result, mode)
 
@@ -169,6 +178,13 @@ def compression_wrapper(
         callback = _COMPRESSOR_REGISTRY[compression]
     except KeyError:
         return file_obj
+
+    if (compression_kwargs or {}).get("indexed_seek") and compression != ".gz":
+        msg = (
+            "indexed_seek is only supported for gzip (.gz) streams; "
+            f"got compression {compression!r}"
+        )
+        raise ValueError(msg)
 
     return callback(file_obj, mode, **(compression_kwargs or {}))
 
