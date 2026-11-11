@@ -1,0 +1,16 @@
+backports-zstd==1.8.0
+certifi==2026.10.23
+charset-normalizer==3.5.2
+idna==3.20
+iniconfig==2.3.1
+lz4==4.4.5
+packaging==26.3
+pluggy==1.7.0
+pygments==2.21.0
+pytest==9.2.0
+pytest-mock==3.17.0
+pyyaml==6.0.3
+requests==2.34.2
+responses==0.26.3
+urllib3==2.8.0
+wrapt==2.5.2
