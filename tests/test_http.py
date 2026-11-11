@@ -8,6 +8,8 @@ import functools
 import gzip
 import io
 import re
+import threading
+import time
 import unittest
 
 import pytest
@@ -625,3 +627,357 @@ def test_read_after_failed_continuation_raises():
             reader.read(len(BYTES))
         assert reader.seek(reader.tell()) == 5
         assert reader.read() == BYTES[5:]
+
+
+class BlockingRaw:
+    """Raw stream whose read() blocks on a gate while recording downloaded bytes."""
+
+    def __init__(self, data, gate=None, error=None):
+        self._data = data
+        self._pos = 0
+        self._gate = gate
+        self._error = error
+        self.closed = False
+        self.reads = []  # requested sizes, in call order
+        self.downloaded = 0
+        self.read_threads = []
+
+    def read(self, size=-1):
+        self.read_threads.append(threading.get_ident())
+        self.reads.append(size)  # register the in-flight read before blocking on the gate
+        if self._gate is not None:
+            self._gate.wait()
+        if self._error is not None:
+            raise self._error
+        if size is None or size < 0:
+            chunk = self._data[self._pos :]
+        else:
+            chunk = self._data[self._pos : self._pos + size]
+        self._pos += len(chunk)
+        self.downloaded += len(chunk)
+        return chunk
+
+    def tell(self):
+        return self._pos
+
+    def close(self):
+        self.closed = True
+        if self._gate is not None:
+            self._gate.set()  # a closed response unblocks a read in flight, like urllib3
+
+
+class FakeSession:
+    """Minimal requests.Session stand-in handing out crafted responses."""
+
+    def __init__(self, factory):
+        self._factory = factory
+        self.closed = False
+        self.calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        return self._factory(url, kwargs)
+
+    def close(self):
+        self.closed = True
+
+
+def _blocking_response(data, gate=None, error=None, headers=None):
+    """Wrap a BlockingRaw in a requests.Response without touching the network."""
+    response = requests.Response()
+    response.status_code = requests.codes.ok
+    response.headers = requests.structures.CaseInsensitiveDict(headers or HEADERS)
+    response.raw = BlockingRaw(data, gate, error)
+    return response
+
+
+def _wait_until(predicate, timeout=5.0, interval=0.01):
+    """Poll predicate until it holds or the timeout elapses."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for condition")
+        time.sleep(interval)
+
+
+class ReadaheadTest(unittest.TestCase):
+    """Explicit readahead mode: worker, byte budget, shared cursor, seek and close."""
+
+    URL = "http://localhost/readahead"
+
+    def _reader(self, data, block_size=8, readahead_size=24, factory=None, session=None):
+        session = session or FakeSession(factory or (lambda url, kwargs: _blocking_response(data)))
+        reader = smart_open.http.SeekableBufferedInputBase(
+            self.URL,
+            buffer_size=block_size,
+            readahead=True,
+            readahead_size=readahead_size,
+            session=session,
+        )
+        return reader, session
+
+    def test_read_readinto_readline_share_cursor(self):
+        """read, readinto and readline advance one logical position."""
+        data = b"first line\nsecond line\nthird line\n"
+        reader, _ = self._reader(data, block_size=8, readahead_size=24)
+
+        assert reader.read(6) == b"first "
+        assert reader.tell() == 6
+
+        target = bytearray(5)
+        assert reader.readinto(target) == 5
+        assert bytes(target) == b"line\n"
+        assert reader.tell() == 11
+
+        assert reader.readline() == b"second line\n"
+        assert reader.tell() == 23
+
+        assert reader.read() == b"third line\n"
+        assert reader.tell() == len(data)
+        assert reader.read() == b""
+        assert reader.readline() == b""
+        reader.close()
+
+    def test_readline_limit_and_block_boundary(self):
+        """readline(size) stops at the limit, keeping the rest for the next call."""
+        data = b"abcdefgh\nij\n"
+        reader, _ = self._reader(data, block_size=4, readahead_size=12)
+
+        assert reader.readline(3) == b"abc"
+        assert reader.tell() == 3
+        assert reader.readline() == b"defgh\n"  # the line continues across blocks
+        assert reader.tell() == 9
+        assert reader.readline() == b"ij\n"
+        assert reader.readline() == b""
+        reader.close()
+
+    def test_read_all_and_eof(self):
+        """read(-1) consumes everything, then reads return empty bytes."""
+        data = b"x" * 30
+        reader, _ = self._reader(data, block_size=8, readahead_size=16)
+        assert reader.read() == data
+        assert reader.tell() == 30
+        assert reader.read() == b""
+        assert reader.read(5) == b""
+        reader.close()
+
+    def test_read_zero_size(self):
+        """read(0) returns empty bytes without touching the worker."""
+        reader, _ = self._reader(b"data", block_size=4, readahead_size=8)
+        assert reader.read(0) == b""
+        assert reader.tell() == 0
+        reader.close()
+
+    def test_budget_caps_buffered_and_inflight_bytes(self):
+        """The worker stops downloading once queued plus in-flight blocks hit the budget."""
+        gate = threading.Event()
+        data = b"0123456789abcdef" * 4  # 64 bytes
+        response = _blocking_response(data, gate)
+        reader, _ = self._reader(data, block_size=8, readahead_size=24, factory=lambda url, kwargs: response)
+
+        # The first block is blocked inside raw.read, charging the full block size
+        _wait_until(lambda: response.raw.reads)
+        gate.set()
+        _wait_until(lambda: response.raw.downloaded == 24)  # three blocks fill the budget
+        time.sleep(0.05)  # prove the worker is stalled, not merely scheduled later
+        assert response.raw.downloaded == 24
+        assert reader._readahead.in_flight == 24
+
+        # Consuming one block frees its budget and lets exactly one more block download
+        assert reader.read(8) == b"01234567"
+        _wait_until(lambda: response.raw.downloaded == 32)
+        time.sleep(0.05)
+        assert response.raw.downloaded == 32
+
+        assert reader.read() == data[8:]
+        _wait_until(lambda: response.raw.downloaded == 64)
+        reader.close()
+
+    def test_paused_consumer_pauses_download(self):
+        """When the caller stops reading, no bytes download past the budget."""
+        gate = threading.Event()
+        data = b"z" * 40
+        response = _blocking_response(data, gate)
+        reader, _ = self._reader(data, block_size=8, readahead_size=16, factory=lambda url, kwargs: response)
+        gate.set()
+
+        _wait_until(lambda: response.raw.downloaded == 16)  # two blocks at most
+        time.sleep(0.1)
+        assert response.raw.downloaded == 16
+        assert reader.tell() == 0  # the consumer paused before reading anything
+        reader.close()
+        assert response.raw.closed
+
+    def test_invalid_readahead_size_rejected(self):
+        """A readahead budget smaller than the block size cannot schedule any block."""
+        with pytest.raises(ValueError, match="readahead_size must be >= buffer_size"):
+            smart_open.http.SeekableBufferedInputBase(
+                self.URL,
+                buffer_size=16,
+                readahead=True,
+                readahead_size=8,
+                session=FakeSession(lambda u, k: None),
+            )
+
+    def test_seek_drops_late_blocks_from_old_position(self):
+        """Blocks downloaded for the old position never leak into reads after a seek."""
+        gate = threading.Event()
+        data = b"abcdefghijklmnopqrstuvwxyz" * 2  # 52 bytes
+        first = _blocking_response(data, gate)
+        second = _blocking_response(data)
+
+        def factory(url, kwargs):
+            if "range" in kwargs["headers"]:
+                start = int(kwargs["headers"]["range"].removeprefix("bytes=").rstrip("-"))
+                return _blocking_response(data[start:])
+            return first
+
+        reader, _ = self._reader(data, block_size=8, readahead_size=24, factory=factory)
+        gate.set()
+        _wait_until(lambda: first.raw.downloaded == 24)  # old position buffered ahead
+
+        assert reader.read(4) == b"abcd"
+        assert reader.tell() == 4
+        reader.seek(20)
+        assert reader.tell() == 20
+        assert reader.read(8) == data[20:28]  # exactly the new position, no stale bytes
+        assert reader.tell() == 28
+        reader.close()
+        assert first.raw.closed
+
+    def test_seek_backward_restarts_stream(self):
+        """A backward seek issues a range request and re-reads from there."""
+        data = b"0123456789" * 5  # 50 bytes
+
+        def factory(url, kwargs):
+            if "range" in kwargs["headers"]:
+                start = int(kwargs["headers"]["range"].removeprefix("bytes=").rstrip("-"))
+                return _blocking_response(data[start:])
+            return _blocking_response(data)
+
+        reader, _ = self._reader(data, block_size=8, readahead_size=16, factory=factory)
+        assert reader.read(10) == data[:10]
+        reader.seek(0)
+        assert reader.tell() == 0
+        assert reader.read(10) == data[:10]
+        reader.close()
+
+    def test_close_stops_worker_and_releases_response(self):
+        """close() stops new downloads, closes the response and joins the worker thread."""
+        gate = threading.Event()
+        data = b"q" * 64
+        response = _blocking_response(data, gate)
+        reader, _ = self._reader(data, block_size=8, readahead_size=16, factory=lambda url, kwargs: response)
+        worker = reader._readahead._thread
+
+        _wait_until(lambda: response.raw.reads)  # the worker is blocked inside raw.read
+        reader.close()
+        assert worker.ident is not None
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()  # the blocked read returned and the thread exited
+        assert response.raw.closed
+        assert reader.closed
+        reader.close()  # closing twice is a no-op
+
+    def test_close_keeps_caller_session_open(self):
+        """The caller-owned session is never closed by the reader."""
+        session = FakeSession(lambda url, kwargs: _blocking_response(b"data"))
+        reader, _ = self._reader(b"data", session=session)
+        assert reader.read() == b"data"
+        reader.close()
+        assert not session.closed
+
+    def test_error_delivered_on_consumption(self):
+        """A failing read surfaces the original error to the consumer, not the worker."""
+        error = OSError("connection reset by peer")
+        response = _blocking_response(b"abcdefgh" * 4, error=error)
+        reader, _ = self._reader(b"", factory=lambda url, kwargs: response)
+
+        with pytest.raises(OSError, match="connection reset by peer") as excinfo:
+            reader.read(4)
+        assert excinfo.value is error  # the original exception object is re-raised
+        reader.close()
+
+    def test_continuation_error_recovered_by_seek(self):
+        """A failed capped-range continuation is delivered, then a seek retries successfully."""
+        failures = [503]
+
+        def factory(url, kwargs):
+            first = int(kwargs["headers"].get("range", "bytes=0-").removeprefix("bytes=").partition("-")[0])
+            if first == 15 and failures:
+                failures.pop()
+                response = _blocking_response(b"")
+                response.status_code = 503
+                response.headers = requests.structures.CaseInsensitiveDict(HEADERS)
+                return response
+            last = min(first + 10, len(BYTES))
+            payload = BYTES[first:last]
+            response = _blocking_response(payload)
+            response.status_code = requests.codes.partial_content
+            response.headers = requests.structures.CaseInsensitiveDict(
+                {**HEADERS, "Content-Range": f"bytes {first}-{last - 1}/{len(BYTES)}"}
+            )
+            return response
+
+        reader, _ = self._reader(BYTES, block_size=8, readahead_size=24, factory=factory)
+        reader.seek(5)
+        with pytest.raises(requests.HTTPError, match="503"):
+            reader.read(len(BYTES))
+        with pytest.raises(OSError, match="seek to retry"):
+            reader.read(10)
+        with pytest.raises(OSError, match="seek to retry"):
+            reader.readline()
+        assert reader.seek(5) == 5
+        assert reader.read() == BYTES[5:]
+        reader.close()
+
+    def test_worker_runs_in_background_and_exits_on_close(self):
+        """The worker thread downloads ahead and is gone after close."""
+        data = b"m" * 32
+        response = _blocking_response(data)
+        reader, _ = self._reader(data, block_size=8, readahead_size=24, factory=lambda url, kwargs: response)
+        worker = reader._readahead._thread
+        assert worker.is_alive()
+        assert worker.name == "smart_open-http-readahead"
+        _wait_until(lambda: response.raw.read_threads)  # the worker started downloading
+        assert set(response.raw.read_threads) == {worker.ident}
+        reader.close()
+        worker.join(timeout=2.0)
+        assert not worker.is_alive()
+
+    def test_forward_seek_within_buffered_blocks_skips_request(self):
+        """A short forward seek consumes buffered blocks without a new GET request."""
+        data = b"a" * 40
+        session = FakeSession(lambda url, kwargs: _blocking_response(data))
+        reader, session = self._reader(data, block_size=8, readahead_size=24, session=session)
+        _wait_until(lambda: reader._readahead.in_flight == 24)  # three blocks are buffered
+        initial_calls = session.calls
+
+        reader.seek(10, whence=smart_open.constants.WHENCE_CURRENT)
+        assert reader.tell() == 10
+        assert reader.read(4) == b"aaaa"
+        assert session.calls == initial_calls  # no new GET request for a buffered seek
+        reader.close()
+
+    def test_forward_seek_past_buffer_falls_back_to_range(self):
+        """A forward seek beyond buffered blocks issues a range request."""
+        data = b"a" * 40
+
+        def factory(url, kwargs):
+            start = int(kwargs["headers"].get("range", "bytes=0-").removeprefix("bytes=").rstrip("-"))
+            response = _blocking_response(data[start:])
+            response.status_code = requests.codes.partial_content
+            response.headers = requests.structures.CaseInsensitiveDict(
+                {**HEADERS, "Content-Range": f"bytes {start}-{len(data) - 1}/{len(data)}"}
+            )
+            return response
+
+        session = FakeSession(factory)
+        reader, session = self._reader(data, block_size=8, readahead_size=16, session=session)
+        _wait_until(lambda: reader._readahead.in_flight == 16)  # only two blocks fit the budget
+        calls_before = session.calls
+        reader.seek(30)  # beyond the 16 buffered bytes
+        assert session.calls > calls_before
+        assert reader.tell() == 30
+        assert reader.read(4) == data[30:34]
+        reader.close()
