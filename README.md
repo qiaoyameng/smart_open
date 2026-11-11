@@ -234,6 +234,8 @@ The top-level `compression` parameter controls compression/decompression behavio
 The supported values for this parameter are:
 
 - `infer_from_extension` (default behavior)
+- `detect`
+- `detect_strict`
 - `disable`
 - `.bz2`
 - `.gz`
@@ -244,6 +246,27 @@ The supported values for this parameter are:
 By default, `smart_open` automatically (de)compresses the file if the filename ends with one of these extensions.
 [See also](https://github.com/piskvorky/smart_open/blob/master/smart_open/compression.py)
 `smart_open.compression.get_supported_compression_types` and `mart_open.compression.register_compressor`.
+
+Some downloads have no filename extension (or a misleading one), yet their
+content is still gzip, bz2 or xz. Pass `compression='detect'` to choose the
+codec from a bounded prefix of the stream itself instead of its name. The
+input does not have to be seekable: the bytes inspected during detection are
+replayed to the decompression layer, and ordinary data whose prefix merely
+resembles a magic signature is never misread as compressed.
+
+```python
+>>> from smart_open import open
+>>> with open('tests/test_data/1984.txt.gz', 'rb', compression='detect') as fin:
+...     print(fin.read(32))
+b'It was a bright cold day in Apri'
+
+```
+
+If the filename extension and the detected content disagree, `detect` logs a
+warning and trusts the content; use `compression='detect_strict'` to raise a
+`ValueError` in that situation instead. A stream that ends in the middle of a
+magic signature raises `EOFError` rather than silently returning truncated
+data. Both detection modes only support reading.
 
 ```python
 >>> from smart_open import open

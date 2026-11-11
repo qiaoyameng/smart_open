@@ -167,6 +167,10 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         opener: Mimics built-in open parameter of the same name.  Ignored.
         compression: Explicitly specify the compression/decompression behavior.
             See ``smart_open.compression.get_supported_compression_types``.
+            Use ``'detect'`` to pick the codec from the stream content (magic
+            bytes) instead of the file extension, e.g. for downloads without
+            an extension; ``'detect_strict'`` additionally raises if the
+            extension and the detected content disagree. Both are read-only.
         compression_kwargs: Keyword arguments forwarded to the registered
             compressor callback. When omitted, each library's own default level
             applies: .gz and .bz2 default to 9 (already their maximum), while

@@ -1,3 +1,7 @@
+# Unreleased
+
+- Add `compression='detect'` and `compression='detect_strict'` modes that pick the read codec from a bounded content prefix (gzip, bz2, xz or plain) instead of the file extension, for extensionless or mislabeled downloads; detection works on non-seekable streams, replays every probed byte to the decoder, diagnoses truncated containers, and warns (or raises, in strict mode) when the extension and content disagree
+
 # 9.0.3, 2026-11-09
 
 - Remove the locals() debug dumps that log credentials (PR [#997](https://github.com/piskvorky/smart_open/pull/997), [@kakkar87d](https://github.com/kakkar87d))

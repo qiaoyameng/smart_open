@@ -27,6 +27,30 @@ INFER_FROM_EXTENSION = "infer_from_extension"
 
 See get_supported_extensions().
 """
+DETECT_FROM_CONTENT = "detect"
+"""Determine the compression from a limited prefix of the data itself.
+
+The first few bytes are inspected for the magic signatures of gzip, bz2 and
+xz.  If none matches, the data is read as-is.  Only supported for reading.
+"""
+DETECT_STRICT = "detect_strict"
+"""Like :data:`DETECT_FROM_CONTENT`, but reject an extension/content mismatch.
+
+Raise :class:`ValueError` when the filename extension names a registered
+codec whose magic signature is not found in the data (or vice versa).
+"""
+
+#
+# Magic signatures used by DETECT_FROM_CONTENT.  Keep the tuples ordered from
+# longest to shortest so prefix matching is unambiguous.
+#
+_MAGIC_SIGNATURES: tuple[tuple[bytes, str], ...] = (
+    (b"\xfd7zXZ\x00", ".xz"),
+    (b"BZh", ".bz2"),
+    (b"\x1f\x8b", ".gz"),
+)
+#: Prefix long enough to distinguish every supported magic signature.
+_DETECT_PREFIX_SIZE = max(len(magic) for magic, _ in _MAGIC_SIGNATURES)
 
 
 def get_supported_compression_types() -> list[str]:
@@ -34,7 +58,13 @@ def get_supported_compression_types() -> list[str]:
 
     See compression paratemeter to smart_open.open().
     """
-    return [NO_COMPRESSION, INFER_FROM_EXTENSION, *get_supported_extensions()]
+    return [
+        NO_COMPRESSION,
+        INFER_FROM_EXTENSION,
+        DETECT_FROM_CONTENT,
+        DETECT_STRICT,
+        *get_supported_extensions(),
+    ]
 
 
 def get_supported_extensions() -> list[str]:
@@ -87,6 +117,120 @@ def _maybe_wrap_buffered(file_obj: Any, mode: str) -> IO[bytes]:
     elif "b" in mode and "r" in mode:
         result = io.BufferedReader(result)
     return result
+
+
+class _PrefixReplay(io.RawIOBase):
+    """Replay bytes already consumed from a non-seekable stream.
+
+    Detection reads a bounded prefix of the underlying stream, but every
+    probed byte still has to reach the final (de)compression layer.  This
+    wrapper serves the buffered prefix first and then transparently falls
+    through to the underlying stream, so no byte is lost and no seeking is
+    required.
+    """
+
+    def __init__(self, stream: IO[bytes], prefix: bytes) -> None:
+        super().__init__()
+        self._stream = stream
+        self._prefix = bytes(prefix)
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
+        if not self._prefix:
+            chunk = self._stream.read(len(buffer))
+            if not chunk:
+                return 0
+            buffer[: len(chunk)] = chunk
+            return len(chunk)
+        chunk = self._prefix[: len(buffer)]
+        size = len(chunk)
+        buffer[:size] = chunk
+        self._prefix = self._prefix[size:]
+        return size
+
+    def close(self) -> None:
+        if not self.closed:
+            super().close()
+            close = getattr(self._stream, "close", None)
+            if close is not None:
+                close()
+
+
+def _identify_prefix(prefix: bytes, stream_exhausted: bool) -> str | None:
+    """Classify a probed prefix.
+
+    Returns the registered extension of a positively identified container,
+    or None for ordinary data / data still too short to decide.
+
+    Raises:
+        EOFError: If the stream ended while its prefix could only be the
+            beginning of a container magic signature, i.e. a truncated
+            container rather than ordinary data.
+    """
+    for magic, extension in _MAGIC_SIGNATURES:
+        if prefix.startswith(magic):
+            return extension
+        if magic.startswith(prefix) and prefix:
+            # The prefix is a proper prefix of a magic signature.  More
+            # bytes could complete it; if there are no more bytes, this is a
+            # truncated container, not ordinary data.
+            if stream_exhausted:
+                msg = (
+                    f"stream ended after {len(prefix)} byte(s) that only match the beginning "
+                    f"of a {extension} container (magic {magic!r}); the data looks truncated"
+                )
+                raise EOFError(msg)
+            return None
+    return None
+
+
+def _detect_compression(
+    file_obj: IO[bytes],
+    filename: str | None,
+    strict: bool,  # noqa: FBT001  # internal dispatch flag, not user-facing config
+) -> tuple[str, IO[bytes]]:
+    """Probe up to ``_DETECT_PREFIX_SIZE`` bytes and pick a read codec.
+
+    Returns the extension of the codec to use (possibly one that is not
+    registered, in which case the caller reads the data as-is) and a stream
+    that replays every probed byte before falling through to ``file_obj``.
+    """
+    prefix = b""
+    while len(prefix) < _DETECT_PREFIX_SIZE:
+        chunk = file_obj.read(_DETECT_PREFIX_SIZE - len(prefix))
+        if not chunk:
+            break
+        prefix += chunk
+    stream_exhausted = len(prefix) < _DETECT_PREFIX_SIZE
+
+    detected = _identify_prefix(prefix, stream_exhausted)
+    if detected is None:
+        detected = NO_COMPRESSION
+    replay: IO[bytes] = _PrefixReplay(file_obj, prefix)
+
+    expected: str | None = None
+    if filename is not None:
+        suffix = Path(filename).suffix.lower()
+        if suffix in _COMPRESSOR_REGISTRY:
+            expected = suffix
+
+    if expected is not None and expected != detected:
+        msg = (
+            f"filename {filename!r} implies {expected} compression, but the content begins "
+            f"with {prefix[:_DETECT_PREFIX_SIZE]!r}; detected {detected!r}"
+        )
+        if strict:
+            replay.close()
+            raise ValueError(msg)
+        logger.warning("%s; using the detected codec instead", msg)
+    elif detected != NO_COMPRESSION and detected not in _COMPRESSOR_REGISTRY:
+        logger.warning(
+            "detected %s compression but no handler is registered; reading the data as-is", detected
+        )
+
+    return detected, replay
 
 
 def _handle_bz2(file_obj: IO[bytes], mode: str, **kwargs: Any) -> IO[Any]:
@@ -146,11 +290,33 @@ def compression_wrapper(
     If `filename` is specified, it will be used to extract the extension.
     If not, the `file_obj.name` attribute is used as the filename.
 
+    With `compression` set to "detect" (or "detect_strict"), the extension is
+    ignored and the codec is chosen by inspecting a bounded prefix of the
+    stream instead (see DETECT_FROM_CONTENT).  The stream does not need to be
+    seekable: every probed byte is replayed to the decompression layer.
+
     If `compression_kwargs` is specified, its contents are forwarded as keyword
     arguments to the registered compressor callback.
     """
     if compression == NO_COMPRESSION:
         return file_obj
+    if compression in (DETECT_FROM_CONTENT, DETECT_STRICT):
+        if "r" not in mode:
+            msg = f"compression {compression!r} is only supported for reading, not mode {mode!r}"
+            raise ValueError(msg)
+        if mode.endswith("+"):
+            msg = f"transparent (de)compression unsupported for mode {mode!r}"
+            raise ValueError(msg)
+        compression, file_obj = _detect_compression(file_obj, filename, strict=(compression == DETECT_STRICT))
+        if compression == NO_COMPRESSION:
+            return file_obj
+        try:
+            return _COMPRESSOR_REGISTRY[compression](file_obj, mode, **(compression_kwargs or {}))
+        except BaseException:
+            # The detect layer already consumed (and owns) the raw stream;
+            # make sure it is finalized if the decompressor fails to start.
+            file_obj.close()
+            raise
     if compression == INFER_FROM_EXTENSION:
         try:
             inferred_name = (filename or file_obj.name).lower()
