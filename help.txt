@@ -204,6 +204,15 @@ FUNCTIONS
             session:
                 The ``requests.Session`` object to use with HTTP GET requests.
                 Can be used for OAuth2 clients.
+            redirect_policy:
+                A callback consulted before every redirect, on the initial
+                GET and on every range request. It receives the source URL, the resolved
+                target URL, the status code and the redirect chain so far, and returns
+                ``True`` to follow or ``False`` to raise :class:`RedirectRejected`. When
+                ``None``, redirects are followed automatically, up to
+                :data:`DEFAULT_MAX_REDIRECTS`; relative ``Location`` headers are resolved
+                and loops are rejected. On a cross-origin redirect, authentication, cookies
+                and other sensitive headers are not sent to the target origin.
             buffer_size:
                 The buffer size to use when performing I/O.
 

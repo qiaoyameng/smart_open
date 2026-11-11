@@ -13,7 +13,8 @@ import logging
 import posixpath
 import re
 import urllib.parse
-from typing import TYPE_CHECKING, TypedDict
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, TypedDict
 
 try:
     import requests
@@ -68,6 +69,166 @@ def _satisfied_range(content_range: str, start: int) -> tuple[int, int | None] |
     return end, total
 
 
+class RedirectInfo(TypedDict):
+    """One redirect offered to a :data:`RedirectPolicy`, before the next request is sent."""
+
+    source: str
+    """The URL that produced the redirect response."""
+
+    target: str
+    """The resolved absolute URL from the ``Location`` header."""
+
+    status_code: int
+    """The 3xx status code of the redirect response."""
+
+    chain: tuple[str, ...]
+    """The URLs requested so far, starting with the originally opened URL."""
+
+
+RedirectPolicy = Callable[[RedirectInfo], bool]
+"""A callback deciding whether a redirect may be followed.
+
+It is called with the source URL, the resolved target URL, the redirect status
+code and the current redirect chain. Returning ``True`` follows the redirect,
+returning ``False`` raises :class:`RedirectRejected`. The callback runs before
+the request for the target is sent, so a rejected target never receives a
+request. Every GET the reader issues -- the initial one, seek range requests and
+continuations of truncated ranges -- goes through the same policy.
+"""
+
+DEFAULT_MAX_REDIRECTS = 30
+"""The default limit on followed redirects, matching ``requests``."""
+
+
+class RedirectRejected(OSError):
+    """Raised when a :data:`RedirectPolicy` refuses a redirect or the chain exceeds its limits."""
+
+
+# requests strips these on cross-origin redirects, including the default Authorization
+# that HTTPBasicAuth adds, so we apply the same rule ourselves before each hop
+_SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "cookie2", "netrc", "www-authenticate"})
+
+
+def _origin(url: str) -> tuple[str, str, int]:
+    parsed = urllib.parse.urlsplit(url)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    return parsed.scheme, parsed.hostname or "", port
+
+
+def _headers_for_hop(headers: dict[str, str], source: str, target: str) -> dict[str, str]:
+    """Drop credentials and sensitive headers when a redirect crosses an origin."""
+    if _origin(source) == _origin(target):
+        return headers
+    return {name: value for name, value in headers.items() if name.lower() not in _SENSITIVE_HEADERS}
+
+
+def _strip_sensitive_headers(prepared: requests.PreparedRequest) -> None:
+    """Remove sensitive headers a Session may have merged in from its defaults or cookie jar."""
+    for name in list(prepared.headers):
+        if name.lower() in _SENSITIVE_HEADERS:
+            del prepared.headers[name]
+
+
+class _RedirectChain:
+    """Follow 3xx responses manually, consulting a policy before every hop."""
+
+    def __init__(
+        self,
+        session: Any,  # requests.Session or the requests module when no Session was given
+        policy: RedirectPolicy | None,
+        max_redirects: int = DEFAULT_MAX_REDIRECTS,
+    ) -> None:
+        self.session = session
+        self.policy = policy
+        self.max_redirects = max_redirects
+
+    def _send(
+        self,
+        url: str,
+        headers: dict[str, str],
+        auth: object,
+        cert: str | tuple[str, str] | None,
+        timeout: float | None,
+        strip_sensitive: bool = False,
+    ) -> requests.Response:
+        """Prepare and send one GET straight to the adapter, so requests never follows redirects itself."""
+        if isinstance(self.session, requests.Session):
+            request = self.session.prepare_request(requests.Request("GET", url, headers=headers, auth=auth))
+            if strip_sensitive:
+                _strip_sensitive_headers(request)
+            adapter = self.session.get_adapter(url=url)
+            response = adapter.send(
+                request,
+                stream=True,
+                timeout=timeout,
+                verify=self.session.verify,
+                cert=cert,
+                proxies=self.session.proxies,
+            )
+        else:  # the bare requests module keeps its own temporary session internally
+            response = self.session.get(
+                url,
+                auth=auth,
+                cert=cert,
+                stream=True,
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+        return response
+
+    def get(
+        self,
+        url: str,
+        headers: dict[str, str],
+        auth: object,
+        cert: str | tuple[str, str] | None,
+        timeout: float | None,
+    ) -> requests.Response:
+        """GET ``url`` and follow its 3xx responses, consulting the policy before every hop."""
+        chain = [url]
+        hop_headers, hop_auth = headers, auth
+        response = self._send(url, hop_headers, hop_auth, cert, timeout)
+        while response.is_redirect:
+            source = chain[-1]
+            location = response.headers.get("location", "")
+            if not location:
+                break
+            target = urllib.parse.urljoin(source, location)
+            cross_origin = _origin(source) != _origin(target)
+            if cross_origin:
+                hop_headers = _headers_for_hop(hop_headers, source, target)
+                hop_auth = None
+            if self.policy is not None:
+                try:
+                    allowed = self.policy(
+                        RedirectInfo(
+                            source=source, target=target, status_code=response.status_code, chain=tuple(chain)
+                        )
+                    )
+                except BaseException:
+                    response.close()
+                    raise
+                if not allowed:
+                    response.close()
+                    msg = f"redirect policy refused {response.status_code} redirect from {source} to {target}"
+                    raise RedirectRejected(msg)
+            if target in chain:
+                response.close()
+                msg = f"redirect loop detected at {target} in chain {chain!r}"
+                raise RedirectRejected(msg)
+            if len(chain) > self.max_redirects:
+                response.close()
+                msg = f"too many redirects (max {self.max_redirects}) in chain {chain!r}"
+                raise RedirectRejected(msg)
+            response.close()
+            response = self._send(target, hop_headers, hop_auth, cert, timeout, strip_sensitive=cross_origin)
+            chain.append(target)
+        return response
+
+
 def parse_uri(uri_as_string: str) -> _HTTPUri:
     """Parse an ``http://`` or ``https://`` URI into its path component."""
     split_uri = urllib.parse.urlsplit(uri_as_string)
@@ -94,6 +255,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     headers: dict[str, str] | None = None,
     timeout: float | None = None,
     session: requests.Session | None = None,
+    redirect_policy: RedirectPolicy | None = None,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
 ) -> BufferedInputBase:
     """Implement streamed reader from a web site.
@@ -117,6 +279,14 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
         timeout: Request timeout in seconds.
         session: The ``requests.Session`` object to use with HTTP GET requests.
             Can be used for OAuth2 clients.
+        redirect_policy: A callback consulted before every redirect, on the initial
+            GET and on every range request. It receives the source URL, the resolved
+            target URL, the status code and the redirect chain so far, and returns
+            ``True`` to follow or ``False`` to raise :class:`RedirectRejected`. When
+            ``None``, redirects are followed automatically, up to
+            :data:`DEFAULT_MAX_REDIRECTS`; relative ``Location`` headers are resolved
+            and loops are rejected. On a cross-origin redirect, authentication, cookies
+            and other sensitive headers are not sent to the target origin.
         buffer_size: The buffer size to use when performing I/O.
 
     Returns:
@@ -140,6 +310,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             cert=cert,
             headers=headers,
             session=session,
+            redirect_policy=redirect_policy,
             timeout=timeout,
         )
         fobj.name = posixpath.basename(urllib.parse.urlparse(uri).path)
@@ -166,12 +337,15 @@ class BufferedInputBase(io.BufferedIOBase):
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
+        redirect_policy: RedirectPolicy | None = None,
         timeout: float | None = None,
     ) -> None:
 
         self.url = url
         self.cert = cert
         self.session = session or requests
+        self.redirect_policy = redirect_policy
+        self._redirects = _RedirectChain(self.session, redirect_policy)
 
         if kerberos:
             import requests_kerberos  # ty: ignore[unresolved-import]  # optional, install requests-kerberos for kerberos=True
@@ -192,12 +366,11 @@ class BufferedInputBase(io.BufferedIOBase):
 
         self.timeout = timeout
 
-        self.response = self.session.get(
+        self.response = self._redirects.get(
             self.url,
+            headers=self.headers,
             auth=self.auth,
             cert=self.cert,
-            stream=True,
-            headers=self.headers,
             timeout=self.timeout,
         )
 
@@ -344,9 +517,22 @@ class SeekableBufferedInputBase(BufferedInputBase):
         cert: str | tuple[str, str] | None = None,
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
+        redirect_policy: RedirectPolicy | None = None,
         timeout: float | None = None,
     ) -> None:
-        super().__init__(url, mode, buffer_size, kerberos, user, password, cert, headers, session, timeout)
+        super().__init__(
+            url,
+            mode,
+            buffer_size,
+            kerberos,
+            user,
+            password,
+            cert,
+            headers,
+            session,
+            redirect_policy,
+            timeout,
+        )
         assert self.response is not None  # noqa: S101  # set by super().__init__
         self.content_length = _content_length(self.response)
         #
@@ -500,11 +686,10 @@ class SeekableBufferedInputBase(BufferedInputBase):
         if start_pos is not None:
             headers["range"] = smart_open.utils.make_range_string(start_pos)
 
-        return self.session.get(
+        return self._redirects.get(
             self.url,
-            auth=self.auth,
-            stream=True,
-            cert=self.cert,
             headers=headers,
+            auth=self.auth,
+            cert=self.cert,
             timeout=self.timeout,
         )

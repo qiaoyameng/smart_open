@@ -625,3 +625,231 @@ def test_read_after_failed_continuation_raises():
             reader.read(len(BYTES))
         assert reader.seek(reader.tell()) == 5
         assert reader.read() == BYTES[5:]
+
+
+class RecordingAdapter(requests.adapters.BaseAdapter):
+    """A fake adapter that answers GETs from a routing table and records every request it receives."""
+
+    def __init__(self, routes):
+        self.routes = routes  # url -> (status, headers, body)
+        self.requests = []  # the PreparedRequests this adapter received
+        self.responses = []  # the Responses it handed out, to check they get closed
+
+    def send(self, request, **kwargs):  # noqa: ARG002  # requests passes stream/timeout/etc.
+        self.requests.append(request)
+        route = self.routes[request.url]
+        status, headers, body = route(request) if callable(route) else route
+        response = requests.Response()
+        response.status_code = status
+        response.headers.update(headers)
+        response.url = request.url
+        response.request = request
+        response.raw = io.BytesIO(body)
+        self.responses.append(response)
+        return response
+
+    def close(self):
+        pass
+
+
+def redirect_chain_session(routes):
+    """A Session whose RecordingAdapter serves the given routes, mounted for both schemes."""
+    session = requests.Session()
+    adapter = RecordingAdapter(routes)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session, adapter
+
+
+def test_redirect_policy_follows_three_hop_chain():
+    """Consult the policy before every hop of a chain, then serve the final body."""
+    routes = {
+        "http://example.com/start": (302, {"Location": "/next"}, b""),
+        "http://example.com/next": (301, {"Location": "http://other.org/final"}, b""),
+        "http://other.org/final": (200, {}, BYTES),
+    }
+    session, adapter = redirect_chain_session(routes)
+    offers = []
+
+    def policy(info):
+        offers.append(info)
+        return True
+
+    with smart_open.http.open(
+        "http://example.com/start", "rb", session=session, redirect_policy=policy
+    ) as reader:
+        assert reader.read() == BYTES
+        assert all(response.raw.closed for response in adapter.responses[:-1])  # intermediates closed on the way
+        assert not adapter.responses[-1].raw.closed  # the body stays open until the reader closes
+
+    assert [request.url for request in adapter.requests] == list(routes)
+    assert offers == [
+        {
+            "source": "http://example.com/start",
+            "target": "http://example.com/next",
+            "status_code": 302,
+            "chain": ("http://example.com/start",),
+        },
+        {
+            "source": "http://example.com/next",
+            "target": "http://other.org/final",
+            "status_code": 301,
+            "chain": ("http://example.com/start", "http://example.com/next"),
+        },
+    ]
+    assert all(response.raw.closed for response in adapter.responses)  # closing the reader closes the final body
+    assert session.get("http://example.com/start", allow_redirects=False).status_code == 302  # session still usable
+
+
+def test_redirect_policy_rejects_cross_origin():
+    """Never send a request to a target the policy refuses, and close the redirect response."""
+    routes = {
+        "http://example.com/start": (302, {"Location": "http://evil.org/final"}, b""),
+        "http://evil.org/final": (200, {}, BYTES),
+    }
+    session, adapter = redirect_chain_session(routes)
+
+    def policy(info):
+        return info["target"].startswith("http://example.com/")
+
+    with pytest.raises(smart_open.http.RedirectRejected, match="evil.org"):
+        smart_open.http.open(
+            "http://example.com/start", "rb", session=session, redirect_policy=policy
+        )
+
+    assert [request.url for request in adapter.requests] == ["http://example.com/start"]  # target never requested
+    assert adapter.responses[0].raw.closed
+    assert session.get("http://example.com/start", allow_redirects=False).status_code == 302  # session still usable
+
+
+def test_redirect_policy_same_origin_different_port():
+    """Treat a different port as a different origin, so a policy can allow it explicitly."""
+    routes = {
+        "http://example.com/start": (302, {"Location": "http://example.com:8080/final"}, b""),
+        "http://example.com:8080/final": (200, {}, BYTES),
+    }
+    session, adapter = redirect_chain_session(routes)
+    offers = []
+
+    def policy(info):
+        offers.append(info)
+        return True
+
+    with smart_open.http.open(
+        "http://example.com/start", "rb", session=session, redirect_policy=policy
+    ) as reader:
+        assert reader.read() == BYTES
+
+    assert offers[0]["target"] == "http://example.com:8080/final"
+    assert [request.url for request in adapter.requests] == list(routes)
+
+
+def test_redirect_strips_sensitive_headers_cross_origin():
+    """Send auth, cookies and sensitive headers only to the origin they belong to."""
+    routes = {
+        "http://example.com/start": (302, {"Location": "http://other.org/final"}, b""),
+        "http://other.org/final": (200, {}, BYTES),
+    }
+    session, adapter = redirect_chain_session(routes)
+    session.headers["Cookie"] = "session=secret"
+    headers = {
+        "Accept-Encoding": "identity",
+        "X-Api-Key": "secret",  # a plain custom header follows the request across origins
+        "WWW-Authenticate": "Bearer token",  # a sensitive custom header is stripped
+    }
+
+    with smart_open.http.open(
+        "http://example.com/start",
+        "rb",
+        session=session,
+        user="user",
+        password="pass",
+        headers=headers,
+        redirect_policy=lambda info: True,
+    ) as reader:
+        assert reader.read() == BYTES
+
+    first, second = adapter.requests
+    assert first.headers["Authorization"].startswith("Basic ")
+    assert first.headers["Cookie"] == "session=secret"
+    assert first.headers["WWW-Authenticate"] == "Bearer token"
+    assert "Authorization" not in second.headers
+    assert "Cookie" not in second.headers
+    assert "WWW-Authenticate" not in second.headers
+    assert second.headers["X-Api-Key"] == "secret"  # only the explicit sensitive set is stripped
+
+
+def test_redirect_rejects_loop_and_missing_location():
+    """Reject a redirect chain that loops, and pass a 3xx without Location through."""
+    routes = {
+        "http://example.com/a": (302, {"Location": "http://example.com/b"}, b""),
+        "http://example.com/b": (302, {"Location": "http://example.com/a"}, b""),
+    }
+    session, adapter = redirect_chain_session(routes)
+    with pytest.raises(smart_open.http.RedirectRejected, match="loop"):
+        smart_open.http.open("http://example.com/a", "rb", session=session)
+    assert len(adapter.requests) == 2  # the loop target is never requested again
+    assert all(response.raw.closed for response in adapter.responses)
+
+    routes = {"http://example.com/a": (302, {}, b"")}  # a redirect status without a Location header
+    session, adapter = redirect_chain_session(routes)
+    with smart_open.http.open("http://example.com/a", "rb", session=session) as reader:
+        assert reader.read() == b""  # not followed, read as a plain response
+    assert len(adapter.requests) == 1
+
+
+def test_redirect_policy_applies_to_seek_and_continuation():
+    """Run seek range requests and continuations of a truncated range through the same policy."""
+    offers = []
+
+    def final(request):
+        if "range" not in request.headers:
+            return 200, {}, BYTES
+        start = int(request.headers["range"].removeprefix("bytes=").partition("-")[0])
+        end = min(start + 10, len(BYTES))  # the server caps every range at 10 bytes
+        return 206, {"Content-Range": f"bytes {start}-{end - 1}/{len(BYTES)}"}, BYTES[start:end]
+
+    routes = {
+        "http://example.com/start": (302, {"Location": "/final"}, b""),
+        "http://example.com/final": final,
+    }
+    session, adapter = redirect_chain_session(routes)
+
+    def policy(info):
+        offers.append(info)
+        return True
+
+    with smart_open.http.open(
+        "http://example.com/start", "rb", session=session, redirect_policy=policy
+    ) as reader:
+        reader.seek(5)
+        assert reader.read() == BYTES[5:]
+
+    # the initial GET, the seek and every truncated-range continuation redirect again
+    num_gets = 1 + (len(BYTES) - 5 + 9) // 10
+    hops = ["http://example.com/start", "http://example.com/final"]
+    assert [request.url for request in adapter.requests] == hops * num_gets
+    assert all(offer["target"] == "http://example.com/final" for offer in offers)
+    assert len(offers) == len(adapter.requests) // 2  # one offer per GET, before each hop
+    assert all(response.raw.closed for response in adapter.responses[:-1])
+
+
+def test_redirect_does_not_mix_versions():
+    """Fail a seek with 412 when the redirect target serves a new version, instead of mixing bytes."""
+
+    def serve(request):
+        if "range" not in request.headers:
+            return 302, {"Location": "/final"}, b""
+        assert request.headers["If-Match"] == '"v2"'  # the range pins the version first read
+        return 412, {}, b""  # the target was replaced in between
+
+    routes = {
+        "http://example.com/start": serve,
+        "http://example.com/final": lambda request: (200, {"ETag": '"v2"'}, BYTES),
+    }
+    session, _ = redirect_chain_session(routes)
+    with (
+        smart_open.http.open("http://example.com/start", "rb", session=session) as reader,
+        pytest.raises(requests.HTTPError, match="412"),
+    ):
+        reader.seek(10)
