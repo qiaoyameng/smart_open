@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from _typeshed import WriteableBuffer
 
     from smart_open._typing import TransportParams
+    from smart_open.iostats import IOStatsRecorder
 
 DEFAULT_BUFFER_SIZE = 128 * 1024
 SCHEMES = ("http", "https")
@@ -95,6 +96,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     timeout: float | None = None,
     session: requests.Session | None = None,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
+    io_stats: IOStatsRecorder | None = None,
 ) -> BufferedInputBase:
     """Implement streamed reader from a web site.
 
@@ -118,6 +120,8 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
         session: The ``requests.Session`` object to use with HTTP GET requests.
             Can be used for OAuth2 clients.
         buffer_size: The buffer size to use when performing I/O.
+        io_stats: Optional recorder counting bytes as they leave the network.
+            When omitted, no accounting happens and reads behave unchanged.
 
     Returns:
         A file-like object opened for reading.
@@ -141,6 +145,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             headers=headers,
             session=session,
             timeout=timeout,
+            io_stats=io_stats,
         )
         fobj.name = posixpath.basename(urllib.parse.urlparse(uri).path)
         return fobj
@@ -167,11 +172,13 @@ class BufferedInputBase(io.BufferedIOBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        io_stats: IOStatsRecorder | None = None,
     ) -> None:
 
         self.url = url
         self.cert = cert
         self.session = session or requests
+        self._io_stats = io_stats
 
         if kerberos:
             import requests_kerberos  # ty: ignore[unresolved-import]  # optional, install requests-kerberos for kerberos=True
@@ -228,6 +235,7 @@ class BufferedInputBase(io.BufferedIOBase):
         assert self._read_buffer is not None  # noqa: S101  # only called while reading
         assert self.response is not None  # noqa: S101  # only called while reading
         filled = self._read_buffer.fill(self.response.raw)
+        self._account(filled)
         if not filled and self._next_response():
             return self._fill()
         return filled
@@ -235,9 +243,21 @@ class BufferedInputBase(io.BufferedIOBase):
     def _read_rest(self) -> bytes:
         assert self.response is not None  # noqa: S101  # only called while reading
         parts = [self.response.raw.read()]
+        self._account(len(parts[0]))
         while self._next_response():
-            parts.append(self.response.raw.read())
+            more = self.response.raw.read()
+            self._account(len(more))
+            parts.append(more)
         return b"".join(parts)
+
+    def _account(self, amount: int) -> None:
+        if amount and self._io_stats is not None:
+            self._io_stats.add_transport(amount)
+
+    @property
+    def io_stats(self) -> IOStatsRecorder | None:
+        """The recorder counting bytes off the network, or None when metering is disabled."""
+        return self._io_stats
 
     def _next_response(self) -> bool:
         """Continue a response that ended early with the next one, which only range readers need."""
@@ -345,8 +365,9 @@ class SeekableBufferedInputBase(BufferedInputBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        io_stats: IOStatsRecorder | None = None,
     ) -> None:
-        super().__init__(url, mode, buffer_size, kerberos, user, password, cert, headers, session, timeout)
+        super().__init__(url, mode, buffer_size, kerberos, user, password, cert, headers, session, timeout, io_stats)
         assert self.response is not None  # noqa: S101  # set by super().__init__
         self.content_length = _content_length(self.response)
         #

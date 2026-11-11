@@ -21,6 +21,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from types import TracebackType
 
+    from smart_open.iostats import IOStatsRecorder
+
 logger = logging.getLogger(__name__)
 
 WORKAROUND_SCHEMES = ["s3", "s3n", "s3a", "gcs", "gs"]
@@ -181,6 +183,7 @@ class FileLikeProxy(wrapt.ObjectProxy):
     """Wrap an `outer` file-like object so that closing it also closes `inner`."""
 
     __inner: Any = ...  # initialized before wrapt disallows __setattr__ on certain objects
+    io_stats: IOStatsRecorder | None = None  # set by smart_open.open when I/O metering is enabled
 
     def __init__(self, outer: IO[Any], inner: IO[Any]) -> None:
         super().__init__(outer)

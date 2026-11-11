@@ -20,6 +20,7 @@ import urllib.parse
 from typing import IO, TYPE_CHECKING, Any, BinaryIO, Literal, TextIO, cast, overload
 
 import smart_open.compression as so_compression
+import smart_open.iostats as so_iostats
 
 #
 # This module defines a function called smart_open so we cannot use
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from smart_open._typing import CompressionKwargs, TransportParams, Uri
+    from smart_open.iostats import IOStatsRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -177,7 +179,15 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             is 'disable' or the URI's extension doesn't match a registered
             compressor.
         transport_params: Additional parameters for the transport layer (see
-            notes below).
+            notes below). One parameter is handled here, before any transport
+            sees it: ``io_stats`` enables per-handle I/O accounting. Pass
+            ``True`` (or an ``IOStatsRecorder``, or a callback receiving an
+            immutable snapshot after every metered read) and the returned
+            handle exposes the recorder as ``.io_stats``, whose
+            ``.snapshot()`` reports ``transport_bytes`` pulled off the
+            network, ``decompressed_bytes`` produced by the (de)compression
+            layer and ``text_chars`` delivered in text mode. Omitted or
+            ``False`` means no accounting and unchanged behavior.
 
     Returns:
         A file-like object.
@@ -214,6 +224,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     if transport_params is None:
         transport_params = {}
 
+    recorder = _io_stats_recorder(transport_params.pop("io_stats", None))
+
     fobj = _shortcut_open(
         uri,
         mode,
@@ -224,7 +236,16 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         newline=newline,
     )
     if fobj is not None:
-        return fobj
+        if recorder is None:
+            return fobj
+        # The shortcut skips the transport/decompression stack, so the one
+        # remaining layer is counted as both transport and decompressed bytes.
+        metered = so_iostats.MeteredReader(
+            fobj, recorder, recorder.add_text if "b" not in mode else recorder.add_decompressed
+        )
+        result = so_utils.FileLikeProxy(metered, metered)
+        result.io_stats = recorder
+        return cast("IO[Any]", result)
 
     #
     # This is a work-around for the problem described in Issue #144.
@@ -261,7 +282,13 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     except ValueError as ve:
         raise NotImplementedError(ve.args[0]) from ve
 
+    if recorder is not None:
+        transport_params["io_stats"] = recorder
     binary = _open_binary_stream(uri, binary_mode, transport_params)
+    if recorder is not None and getattr(binary, "io_stats", None) is not recorder:
+        # The transport ignored the recorder: count its deliveries instead of
+        # network arrivals, which this transport does not meter itself.
+        binary = so_iostats.MeteredReader(binary, recorder, recorder.add_transport)
     name = getattr(binary, "name", None)
     # prefer the stream's own name; if it's not string-like (e.g. ftp socket fileno), fall back to uri
     filename = name if isinstance(name, str) else uri if isinstance(uri, str) else None
@@ -272,6 +299,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         filename=filename,
         compression_kwargs=compression_kwargs,
     )
+    if recorder is not None and decompressed is not binary:
+        decompressed = so_iostats.MeteredReader(decompressed, recorder, recorder.add_decompressed)
 
     if "b" not in mode or explicit_encoding is not None:
         decoded = _encoding_wrapper(
@@ -281,6 +310,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             errors=errors,
             newline=newline,
         )
+        if recorder is not None:
+            decoded = so_iostats.MeteredReader(decoded, recorder, recorder.add_text)
     else:
         decoded = decompressed
 
@@ -295,7 +326,24 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             with contextlib.suppress(AttributeError):
                 setattr(decoded, attr, getattr(binary, attr))
 
-    return cast("IO[Any]", so_utils.FileLikeProxy(decoded, binary))
+    result = so_utils.FileLikeProxy(decoded, binary)
+    if recorder is not None:
+        result.io_stats = recorder
+    return cast("IO[Any]", result)
+
+
+def _io_stats_recorder(option: Any) -> IOStatsRecorder | None:
+    """Normalize the ``io_stats`` transport parameter into a recorder, or None when metering is off."""
+    if option is None or option is False:
+        return None
+    if option is True:
+        return so_iostats.IOStatsRecorder()
+    if isinstance(option, so_iostats.IOStatsRecorder):
+        return option
+    if callable(option):
+        return so_iostats.IOStatsRecorder(option)
+    msg = f"invalid io_stats option: {option!r}"
+    raise TypeError(msg)
 
 
 def _get_binary_mode(mode_str: str) -> str:  # noqa: C901  # legacy internal helper; refactor in a dedicated PR
@@ -459,7 +507,12 @@ def _open_binary_stream(uri: Uri, mode: str, transport_params: TransportParams) 
 
     scheme = _sniff_scheme(uri)
     submodule = transport.get_transport(scheme)
-    fobj = submodule.open_uri(uri, mode, transport_params)
+    # Only hand io_stats to transports that accept it natively; otherwise their
+    # check_kwargs would warn, and the caller falls back to a metering wrapper.
+    params = dict(transport_params)
+    if "io_stats" in params and "io_stats" not in so_utils.inspect_kwargs(submodule.open):
+        params.pop("io_stats")
+    fobj = submodule.open_uri(uri, mode, params)
     if not hasattr(fobj, "name"):
         fobj.name = uri
 
