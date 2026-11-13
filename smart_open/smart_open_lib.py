@@ -96,6 +96,8 @@ def open(
     opener: Callable[[str, int], int] | None = ...,
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
+    detect_conflict: str = ...,
+    detect_truncated: str = ...,
     transport_params: TransportParams | None = ...,
 ) -> TextIO: ...
 
@@ -113,6 +115,8 @@ def open(
     opener: Callable[[str, int], int] | None = ...,
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
+    detect_conflict: str = ...,
+    detect_truncated: str = ...,
     transport_params: TransportParams | None = ...,
 ) -> BinaryIO: ...
 
@@ -129,6 +133,8 @@ def open(
     opener: Callable[[str, int], int] | None = ...,
     compression: str = ...,
     compression_kwargs: CompressionKwargs | None = ...,
+    detect_conflict: str = ...,
+    detect_truncated: str = ...,
     transport_params: TransportParams | None = ...,
 ) -> IO[Any]: ...
 
@@ -144,6 +150,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     opener: Callable[[str, int], int] | None = None,  # noqa: ARG001  # public API
     compression: str = so_compression.INFER_FROM_EXTENSION,
     compression_kwargs: CompressionKwargs | None = None,
+    detect_conflict: str = so_compression.CONFLICT_WARN,
+    detect_truncated: str = so_compression.TRUNCATED_ERROR,
     transport_params: TransportParams | None = None,
 ) -> IO[Any]:
     r"""Open the URI object, returning a file-like object.
@@ -167,6 +175,10 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         opener: Mimics built-in open parameter of the same name.  Ignored.
         compression: Explicitly specify the compression/decompression behavior.
             See ``smart_open.compression.get_supported_compression_types``.
+            Pass ``'detect'`` to identify gzip/bz2/xz/zstd/lz4 (or plain data)
+            from the leading bytes of the stream; no filename extension is
+            required and the source need not be seekable.  Explicit codec
+            values such as ``'.gz'`` always take precedence over detection.
         compression_kwargs: Keyword arguments forwarded to the registered
             compressor callback. When omitted, each library's own default level
             applies: .gz and .bz2 default to 9 (already their maximum), while
@@ -176,6 +188,14 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             or ``{'compression_level': 16}`` for .lz4. Ignored when compression
             is 'disable' or the URI's extension doesn't match a registered
             compressor.
+        detect_conflict: Only used when compression is ``'detect'``.  ``'warn'``
+            (the default) trusts the detected content and logs a warning when
+            the filename extension contradicts it; ``'strict'`` raises
+            ``ValueError`` on such a mismatch.
+        detect_truncated: Only used when compression is ``'detect'``.  ``'error'``
+            (the default) raises ``EOFError`` when the stream ends in the middle
+            of a compression signature; ``'plain'`` treats the unfinished
+            signature as ordinary, uncompressed data instead.
         transport_params: Additional parameters for the transport layer (see
             notes below).
 
@@ -271,6 +291,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         compression,
         filename=filename,
         compression_kwargs=compression_kwargs,
+        detect_conflict=detect_conflict,
+        detect_truncated=detect_truncated,
     )
 
     if "b" not in mode or explicit_encoding is not None:

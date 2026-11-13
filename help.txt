@@ -37,7 +37,7 @@ PACKAGE CONTENTS
     webhdfs
 
 FUNCTIONS
-    open(uri: 'Uri', mode: 'str' = 'r', buffering: 'int' = -1, encoding: 'str | None' = None, errors: 'str | None' = None, newline: 'str | None' = None, closefd: 'bool' = True, opener: 'Callable[[str, int], int] | None' = None, compression: 'str' = 'infer_from_extension', compression_kwargs: 'CompressionKwargs | None' = None, transport_params: 'TransportParams | None' = None) -> 'IO[Any]'
+    open(uri: 'Uri', mode: 'str' = 'r', buffering: 'int' = -1, encoding: 'str | None' = None, errors: 'str | None' = None, newline: 'str | None' = None, closefd: 'bool' = True, opener: 'Callable[[str, int], int] | None' = None, compression: 'str' = 'infer_from_extension', compression_kwargs: 'CompressionKwargs | None' = None, detect_conflict: 'str' = 'warn', detect_truncated: 'str' = 'error', transport_params: 'TransportParams | None' = None) -> 'IO[Any]'
         Open the URI object, returning a file-like object.
 
         The URI is usually a string in a variety of formats.
@@ -59,6 +59,10 @@ FUNCTIONS
             opener: Mimics built-in open parameter of the same name.  Ignored.
             compression: Explicitly specify the compression/decompression behavior.
                 See ``smart_open.compression.get_supported_compression_types``.
+                Pass ``'detect'`` to identify gzip/bz2/xz/zstd/lz4 (or plain data)
+                from the leading bytes of the stream; no filename extension is
+                required and the source need not be seekable.  Explicit codec
+                values such as ``'.gz'`` always take precedence over detection.
             compression_kwargs: Keyword arguments forwarded to the registered
                 compressor callback. When omitted, each library's own default level
                 applies: .gz and .bz2 default to 9 (already their maximum), while
@@ -68,6 +72,14 @@ FUNCTIONS
                 or ``{'compression_level': 16}`` for .lz4. Ignored when compression
                 is 'disable' or the URI's extension doesn't match a registered
                 compressor.
+            detect_conflict: Only used when compression is ``'detect'``.  ``'warn'``
+                (the default) trusts the detected content and logs a warning when
+                the filename extension contradicts it; ``'strict'`` raises
+                ``ValueError`` on such a mismatch.
+            detect_truncated: Only used when compression is ``'detect'``.  ``'error'``
+                (the default) raises ``EOFError`` when the stream ends in the middle
+                of a compression signature; ``'plain'`` treats the unfinished
+                signature as ordinary, uncompressed data instead.
             transport_params: Additional parameters for the transport layer (see
                 notes below).
 

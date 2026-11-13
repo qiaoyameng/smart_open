@@ -234,6 +234,7 @@ The top-level `compression` parameter controls compression/decompression behavio
 The supported values for this parameter are:
 
 - `infer_from_extension` (default behavior)
+- `detect`
 - `disable`
 - `.bz2`
 - `.gz`
@@ -273,6 +274,33 @@ To specify the algorithm explicitly (e.g. for non-standard file extensions):
 It was a bright cold day in Apri
 
 ```
+
+Some downloads have no filename extension (or a misleading one) but still
+return gzip/bz2/xz/zstd/lz4 bytes. Pass `compression='detect'` to identify the
+format from the leading bytes of the stream instead. The source does not need
+to be seekable: every byte consumed while sniffing is replayed to the
+decompressor, so nothing is lost. Explicit codec values such as `'.gz'` always
+take precedence over detection.
+
+```python
+>>> import gzip, tempfile
+>>> from smart_open import open
+>>> with tempfile.NamedTemporaryFile() as tmp:  # no .gz suffix
+...     _ = tmp.write(gzip.compress(b'hello world'))
+...     _ = tmp.flush()
+...     with open(tmp.name, 'rb', compression='detect') as fin:
+...         print(fin.read())
+b'hello world'
+
+```
+
+Two optional policies control the edge cases:
+
+- `detect_conflict`: `'warn'` (default) trusts the detected content and logs a
+  warning when the extension contradicts it; `'strict'` raises `ValueError`.
+- `detect_truncated`: `'error'` (default) raises `EOFError` when the stream
+  ends in the middle of a compression signature; `'plain'` returns the
+  unfinished signature as ordinary, uncompressed data.
 
 To forward per-call options to the compression library (e.g. lower gzip's
 default `compresslevel` of 9 for faster writes), pass `compression_kwargs`:

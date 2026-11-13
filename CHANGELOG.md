@@ -1,3 +1,11 @@
+# Unreleased
+
+- Add `compression='detect'`, which sniffs the leading bytes of a stream to recognize gzip,
+  bz2, xz, zstd, lz4 or plain data. The source need not be seekable: bytes consumed during
+  sniffing are replayed to the codec, and explicit codec values still take precedence.
+- Add `detect_conflict` (`'warn'`/`'strict'`) and `detect_truncated` (`'error'`/`'plain'`)
+  policies for extension/content mismatches and streams that end inside a magic signature.
+
 # 9.0.3, 2026-11-09
 
 - Remove the locals() debug dumps that log credentials (PR [#997](https://github.com/piskvorky/smart_open/pull/997), [@kakkar87d](https://github.com/kakkar87d))
