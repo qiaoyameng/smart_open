@@ -203,9 +203,21 @@ FUNCTIONS
                 Request timeout in seconds.
             session:
                 The ``requests.Session`` object to use with HTTP GET requests.
-                Can be used for OAuth2 clients.
+                Can be used for OAuth2 clients. The session stays owned by the caller;
+                the reader never closes it.
             buffer_size:
-                The buffer size to use when performing I/O.
+                The buffer size to use when performing I/O. With readahead enabled,
+                this is the size of each block the background worker downloads.
+            readahead:
+                If True, download upcoming blocks in a background worker thread so
+                the next read does not wait for a network round trip. Off by default, and
+                only ``"rb"`` reads are affected. Pausing consumption pauses the download
+                once the readahead budget fills up.
+            readahead_size:
+                The total readahead budget in bytes, covering both the blocks
+                already buffered and the block currently being downloaded. Must be at least
+                ``buffer_size`` so one block can always be in flight. Ignored unless
+                ``readahead`` is True.
 
             s3/s3n/s3a (smart_open/s3.py)
             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
