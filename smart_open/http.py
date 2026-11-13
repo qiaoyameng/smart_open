@@ -22,6 +22,7 @@ except ImportError:
 
 import smart_open.utils
 from smart_open import bytebuffer, constants
+from smart_open.io_stats import IOStats
 
 if TYPE_CHECKING:
     from _typeshed import WriteableBuffer
@@ -95,6 +96,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     timeout: float | None = None,
     session: requests.Session | None = None,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
+    io_stats: IOStats | None = None,
 ) -> BufferedInputBase:
     """Implement streamed reader from a web site.
 
@@ -118,6 +120,9 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
         session: The ``requests.Session`` object to use with HTTP GET requests.
             Can be used for OAuth2 clients.
         buffer_size: The buffer size to use when performing I/O.
+        io_stats: Optional per-handle :class:`~smart_open.io_stats.IOStats` that
+            accumulates the raw bytes read from the transport. When ``None`` (the
+            default), no accounting happens and behavior is unchanged.
 
     Returns:
         A file-like object opened for reading.
@@ -141,6 +146,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             headers=headers,
             session=session,
             timeout=timeout,
+            io_stats=io_stats,
         )
         fobj.name = posixpath.basename(urllib.parse.urlparse(uri).path)
         return fobj
@@ -167,6 +173,7 @@ class BufferedInputBase(io.BufferedIOBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        io_stats: IOStats | None = None,
     ) -> None:
 
         self.url = url
@@ -208,6 +215,7 @@ class BufferedInputBase(io.BufferedIOBase):
         self._read_buffer = bytebuffer.ByteBuffer(buffer_size)
         self._current_pos = 0
         self._failed = False  # a range request failed, so reads raise instead of reading as EOF
+        self._io_stats = io_stats
 
     #
     # Override some methods from io.IOBase.
@@ -228,15 +236,26 @@ class BufferedInputBase(io.BufferedIOBase):
         assert self._read_buffer is not None  # noqa: S101  # only called while reading
         assert self.response is not None  # noqa: S101  # only called while reading
         filled = self._read_buffer.fill(self.response.raw)
+        # Only bytes actually pulled off the wire count; reads satisfied from
+        # _read_buffer never reach here, so buffered re-reads (and seeks inside
+        # the buffer) are not charged again.
+        if self._io_stats is not None:
+            self._io_stats.record_transport(filled)
         if not filled and self._next_response():
             return self._fill()
         return filled
 
     def _read_rest(self) -> bytes:
         assert self.response is not None  # noqa: S101  # only called while reading
-        parts = [self.response.raw.read()]
+        part = self.response.raw.read()
+        if self._io_stats is not None:
+            self._io_stats.record_transport(len(part))
+        parts = [part]
         while self._next_response():
-            parts.append(self.response.raw.read())
+            part = self.response.raw.read()
+            if self._io_stats is not None:
+                self._io_stats.record_transport(len(part))
+            parts.append(part)
         return b"".join(parts)
 
     def _next_response(self) -> bool:
@@ -345,8 +364,21 @@ class SeekableBufferedInputBase(BufferedInputBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        io_stats: IOStats | None = None,
     ) -> None:
-        super().__init__(url, mode, buffer_size, kerberos, user, password, cert, headers, session, timeout)
+        super().__init__(
+            url,
+            mode,
+            buffer_size,
+            kerberos,
+            user,
+            password,
+            cert,
+            headers,
+            session,
+            timeout,
+            io_stats,
+        )
         assert self.response is not None  # noqa: S101  # set by super().__init__
         self.content_length = _content_length(self.response)
         #

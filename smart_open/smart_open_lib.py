@@ -28,6 +28,7 @@ import smart_open.compression as so_compression
 import smart_open.local_file as so_file
 import smart_open.utils as so_utils
 from smart_open import doctools, transport
+from smart_open.io_stats import IOStats, wrap_binary_stream, wrap_text_stream
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -214,6 +215,15 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
     if transport_params is None:
         transport_params = {}
 
+    # The IOStats handle is cross-layer (transport + compression + text). It
+    # travels through transport_params into the transport reader, and is popped
+    # right after, so it never reaches a transport that would treat it as an
+    # unsupported keyword (HTTP's open() accepts it explicitly).
+    io_stats = transport_params.get("io_stats")
+    if io_stats is not None and not isinstance(io_stats, IOStats):
+        msg = "transport_params['io_stats'] must be an smart_open.io_stats.IOStats instance"
+        raise TypeError(msg)
+
     fobj = _shortcut_open(
         uri,
         mode,
@@ -262,6 +272,9 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         raise NotImplementedError(ve.args[0]) from ve
 
     binary = _open_binary_stream(uri, binary_mode, transport_params)
+    # The transport (when supported) has consumed the handle; remove it before
+    # any other component inspects the caller-supplied transport_params.
+    transport_params.pop("io_stats", None)
     name = getattr(binary, "name", None)
     # prefer the stream's own name; if it's not string-like (e.g. ftp socket fileno), fall back to uri
     filename = name if isinstance(name, str) else uri if isinstance(uri, str) else None
@@ -273,6 +286,13 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
         compression_kwargs=compression_kwargs,
     )
 
+    if io_stats is not None:
+        # The bytes leaving this stage are post-decompression application bytes.
+        # With compression disabled this wraps the binary transport itself, but
+        # transport_bytes is still metered independently inside the transport,
+        # so the two counters never share an increment.
+        decompressed = wrap_binary_stream(decompressed, io_stats)
+
     if "b" not in mode or explicit_encoding is not None:
         decoded = _encoding_wrapper(
             decompressed,
@@ -281,6 +301,8 @@ def open(  # noqa: C901, PLR0913  # legacy public API; refactor in a dedicated P
             errors=errors,
             newline=newline,
         )
+        if io_stats is not None:
+            decoded = wrap_text_stream(decoded, io_stats)
     else:
         decoded = decompressed
 
