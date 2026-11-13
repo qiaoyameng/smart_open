@@ -13,7 +13,8 @@ import logging
 import posixpath
 import re
 import urllib.parse
-from typing import TYPE_CHECKING, TypedDict
+from collections.abc import Callable
+from typing import TYPE_CHECKING, NamedTuple, TypeAlias, TypedDict
 
 try:
     import requests
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
     from smart_open._typing import TransportParams
 
 DEFAULT_BUFFER_SIZE = 128 * 1024
+DEFAULT_MAX_REDIRECTS = 30
 SCHEMES = ("http", "https")
 
 logger = logging.getLogger(__name__)
@@ -48,6 +50,76 @@ the client (us) has to decompress them with the appropriate algorithm.
 """
 
 _CONTENT_RANGE = re.compile(r"bytes (\d+)-(\d+)/(\d+|\*)")
+
+
+class _Origin(NamedTuple):
+    """The tuple of URL components that identify an HTTP origin."""
+
+    scheme: str
+    host: str
+    port: int | None
+
+
+class RedirectError(OSError):
+    """Base class for redirects the transport refuses to follow."""
+
+
+class RedirectRejected(RedirectError):
+    """Raised when the configured :data:`RedirectPolicy` denies a redirect."""
+
+
+class RedirectLoop(RedirectError):
+    """Raised when a redirect points at a URL already visited in this chain."""
+
+
+class TooManyRedirects(RedirectError):
+    """Raised when a redirect chain exceeds :data:`DEFAULT_MAX_REDIRECTS`."""
+
+
+RedirectPolicy: TypeAlias = Callable[[str, str, int, tuple[str, ...]], bool]
+"""Decide whether the transport may follow one HTTP redirect.
+
+Called before every redirect request is sent, so a denied target never
+receives a request. The arguments are, in order:
+
+* ``source``: the URL that returned the redirect response.
+* ``target``: the absolute URL the ``Location`` header resolves to.
+* ``status_code``: the 3xx status code of the redirect response.
+* ``chain``: every URL already requested in this chain, starting with the
+  original URL and ending with ``source``.
+
+Return ``True`` to follow, or ``False`` to reject. Loop detection and the
+total hop limit are always enforced by the transport, independently of this
+callback. When no policy is given, every sanitized redirect is followed up to
+:data:`DEFAULT_MAX_REDIRECTS` hops.
+"""
+
+#: Headers that must never be forwarded to another origin. ``Authorization``
+#: covers the ``auth`` argument, which is not re-sent cross-origin either.
+SENSITIVE_REDIRECT_HEADERS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "cookie2",
+        "proxy-authorization",
+        "x-api-key",
+        "x-auth-token",
+    }
+)
+
+
+def default_redirect_policy(source: str, target: str, status_code: int, chain: tuple[str, ...]) -> bool:
+    """Follow every redirect; the transport still enforces loops and the hop limit."""
+    return True
+
+
+def _origin(url: str) -> _Origin:
+    parsed = urllib.parse.urlsplit(url)
+    return _Origin(parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port)
+
+
+def _same_origin(left: str, right: str) -> bool:
+    return _origin(left) == _origin(right)
 
 
 def _content_length(response: requests.Response) -> int:
@@ -95,6 +167,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     timeout: float | None = None,
     session: requests.Session | None = None,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
+    redirect_policy: RedirectPolicy | None = None,
 ) -> BufferedInputBase:
     """Implement streamed reader from a web site.
 
@@ -118,6 +191,9 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
         session: The ``requests.Session`` object to use with HTTP GET requests.
             Can be used for OAuth2 clients.
         buffer_size: The buffer size to use when performing I/O.
+        redirect_policy: A callback invoked before each redirect is followed.
+            See :data:`RedirectPolicy`. When ``None``, redirects are followed
+            automatically up to :data:`DEFAULT_MAX_REDIRECTS` hops.
 
     Returns:
         A file-like object opened for reading.
@@ -141,6 +217,7 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             headers=headers,
             session=session,
             timeout=timeout,
+            redirect_policy=redirect_policy,
         )
         fobj.name = posixpath.basename(urllib.parse.urlparse(uri).path)
         return fobj
@@ -167,11 +244,13 @@ class BufferedInputBase(io.BufferedIOBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        redirect_policy: RedirectPolicy | None = None,
     ) -> None:
 
         self.url = url
         self.cert = cert
         self.session = session or requests
+        self.redirect_policy = redirect_policy or default_redirect_policy
 
         if kerberos:
             import requests_kerberos  # ty: ignore[unresolved-import]  # optional, install requests-kerberos for kerberos=True
@@ -192,13 +271,8 @@ class BufferedInputBase(io.BufferedIOBase):
 
         self.timeout = timeout
 
-        self.response = self.session.get(
-            self.url,
-            auth=self.auth,
-            cert=self.cert,
-            stream=True,
-            headers=self.headers,
-            timeout=self.timeout,
+        self.response, self._resolved_url = self._follow_redirects(
+            self.url, self.headers, self.auth
         )
 
         if not self.response.ok:
@@ -208,6 +282,70 @@ class BufferedInputBase(io.BufferedIOBase):
         self._read_buffer = bytebuffer.ByteBuffer(buffer_size)
         self._current_pos = 0
         self._failed = False  # a range request failed, so reads raise instead of reading as EOF
+
+    def _follow_redirects(
+        self, url: str, headers: dict[str, str], auth: object
+    ) -> tuple[requests.Response, str]:
+        """Send a GET, following redirects manually through :attr:`redirect_policy`.
+
+        Relative ``Location`` values are resolved against the requesting URL,
+        and each hop is offered to the policy before its request is sent, so a
+        rejected target never receives traffic. Every intermediate response is
+        closed before the next request. On a cross-origin hop the
+        ``Authorization``/``Cookie``/sensitive custom headers and the ``auth``
+        argument are dropped and stay dropped for every later hop. The caller
+        still owns the returned final response.
+        """
+        chain: list[str] = []
+        current_url, current_headers, current_auth = url, dict(headers), auth
+        while True:
+            if current_url in chain:
+                msg = f"redirect loop detected at {current_url} in chain {' -> '.join([*chain, current_url])}"
+                raise RedirectLoop(msg)
+            if len(chain) >= DEFAULT_MAX_REDIRECTS:
+                msg = f"exceeded {DEFAULT_MAX_REDIRECTS} redirects for {url}"
+                raise TooManyRedirects(msg)
+
+            response = self.session.get(
+                current_url,
+                auth=current_auth,
+                cert=self.cert,
+                stream=True,
+                headers=current_headers,
+                timeout=self.timeout,
+                allow_redirects=False,
+            )
+            chain.append(current_url)
+
+            if not response.is_redirect:
+                return response, current_url
+
+            target = urllib.parse.urljoin(current_url, response.headers["location"])
+            status_code = response.status_code
+            response.close()  # release every intermediate response promptly
+
+            if not self.redirect_policy(chain[-1], target, status_code, tuple(chain)):
+                msg = f"redirect policy rejected {status_code} redirect from {chain[-1]} to {target}"
+                raise RedirectRejected(msg)
+
+            if _same_origin(current_url, target):
+                # Keep whatever the previous hop was allowed to send, so a
+                # later same-origin hop cannot restore credentials dropped at
+                # an earlier cross-origin one.
+                current_headers, current_auth = dict(current_headers), current_auth
+            else:
+                # Never leak credentials, cookies or sensitive custom headers
+                # to another origin; the session's own cookie jar likewise
+                # only sends cookies scoped to the target host. Filter the
+                # headers in flight rather than the originals, which could
+                # re-add something an earlier cross-origin hop already dropped.
+                current_headers = {
+                    name: value
+                    for name, value in current_headers.items()
+                    if name.lower() not in SENSITIVE_REDIRECT_HEADERS
+                }
+                current_auth = None
+            current_url = target
 
     #
     # Override some methods from io.IOBase.
@@ -345,9 +483,29 @@ class SeekableBufferedInputBase(BufferedInputBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        redirect_policy: RedirectPolicy | None = None,
     ) -> None:
-        super().__init__(url, mode, buffer_size, kerberos, user, password, cert, headers, session, timeout)
+        super().__init__(
+            url,
+            mode,
+            buffer_size,
+            kerberos,
+            user,
+            password,
+            cert,
+            headers,
+            session,
+            timeout,
+            redirect_policy,
+        )
         assert self.response is not None  # noqa: S101  # set by super().__init__
+        #
+        # Pin the URL the first response actually came from. A later range
+        # request that ends up at a different URL is another version of the
+        # resource; refusing it keeps already delivered bytes from being
+        # concatenated with a different body, on top of the 412 precondition.
+        #
+        self._pinned_url = self._resolved_url
         self.content_length = _content_length(self.response)
         #
         # We assume the HTTP stream is seekable unless the server explicitly
@@ -500,11 +658,12 @@ class SeekableBufferedInputBase(BufferedInputBase):
         if start_pos is not None:
             headers["range"] = smart_open.utils.make_range_string(start_pos)
 
-        return self.session.get(
-            self.url,
-            auth=self.auth,
-            stream=True,
-            cert=self.cert,
-            headers=headers,
-            timeout=self.timeout,
-        )
+        response, resolved_url = self._follow_redirects(self.url, headers, self.auth)
+        if resolved_url != self._pinned_url:
+            response.close()
+            msg = (
+                f"redirect for {self.url} resolved to {resolved_url}, "
+                f"but this stream was opened from {self._pinned_url}; refusing to mix versions"
+            )
+            raise RedirectError(msg)
+        return response
