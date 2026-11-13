@@ -35,9 +35,35 @@ logger.addHandler(logging.NullHandler())
 
 from .compression import register_compressor  # noqa: E402  # logger setup precedes imports (see #474)
 from .smart_open_lib import open, parse_uri  # noqa: E402  # logger setup precedes imports (see #474)
+from .slices import (  # noqa: E402
+    ReadOnlySlice,
+    ReadonlySlice,
+    Slice,
+    SliceReader,
+    SlicedReader,
+    SliceView,
+    open_byte_range,
+    open_range,
+    open_slice,
+    read_slice,
+    slice_view,
+)
 
 __all__ = [
+    "ReadOnlySlice",
+    "ReadonlySlice",
+    "Slice",
+    "SliceReader",
+    "SlicedReader",
+    "SliceView",
     "open",
+    "open_byte_range",
+    "open_range",
+    "open_slice",
     "parse_uri",
+    "read_slice",
     "register_compressor",
+    "slice_view",
 ]
+
+slice = open_slice  # noqa: A001  # compatibility alias for the slice-opening function

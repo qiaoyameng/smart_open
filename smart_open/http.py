@@ -95,6 +95,8 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
     timeout: float | None = None,
     session: requests.Session | None = None,
     buffer_size: int = DEFAULT_BUFFER_SIZE,
+    range_start: int | None = None,
+    range_stop: int | None = None,
 ) -> BufferedInputBase:
     """Implement streamed reader from a web site.
 
@@ -118,6 +120,10 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
         session: The ``requests.Session`` object to use with HTTP GET requests.
             Can be used for OAuth2 clients.
         buffer_size: The buffer size to use when performing I/O.
+        range_start: When set, make the first request a byte-range request
+            beginning at this offset instead of fetching the resource from zero.
+        range_stop: The exclusive end of the first byte range.  ``None`` means
+            an open-ended ``bytes=start-`` request.
 
     Returns:
         A file-like object opened for reading.
@@ -141,6 +147,8 @@ def open(  # noqa: PLR0913  # legacy public API; refactor in a dedicated PR
             headers=headers,
             session=session,
             timeout=timeout,
+            range_start=range_start,
+            range_stop=range_stop,
         )
         fobj.name = posixpath.basename(urllib.parse.urlparse(uri).path)
         return fobj
@@ -167,6 +175,7 @@ class BufferedInputBase(io.BufferedIOBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        _defer_open: bool = False,
     ) -> None:
 
         self.url = url
@@ -192,18 +201,19 @@ class BufferedInputBase(io.BufferedIOBase):
 
         self.timeout = timeout
 
-        self.response = self.session.get(
-            self.url,
-            auth=self.auth,
-            cert=self.cert,
-            stream=True,
-            headers=self.headers,
-            timeout=self.timeout,
-        )
+        if not _defer_open:
+            self.response = self.session.get(
+                self.url,
+                auth=self.auth,
+                cert=self.cert,
+                stream=True,
+                headers=self.headers,
+                timeout=self.timeout,
+            )
 
-        if not self.response.ok:
-            self.response.close()
-            self.response.raise_for_status()
+            if not self.response.ok:
+                self.response.close()
+                self.response.raise_for_status()
 
         self._read_buffer = bytebuffer.ByteBuffer(buffer_size)
         self._current_pos = 0
@@ -345,30 +355,83 @@ class SeekableBufferedInputBase(BufferedInputBase):
         headers: dict[str, str] | None = None,
         session: requests.Session | None = None,
         timeout: float | None = None,
+        range_start: int | None = None,
+        range_stop: int | None = None,
     ) -> None:
-        super().__init__(url, mode, buffer_size, kerberos, user, password, cert, headers, session, timeout)
-        assert self.response is not None  # noqa: S101  # set by super().__init__
-        self.content_length = _content_length(self.response)
-        #
-        # We assume the HTTP stream is seekable unless the server explicitly
-        # tells us it isn't.  It's better to err on the side of "seekable"
-        # because we don't want to prevent users from seeking a stream that
-        # does not appear to be seekable but really is.
-        #
-        self._seekable = self.response.headers.get("Accept-Ranges", "").lower() != "none"
-        #
-        # Range requests carry a precondition on the version of this first response,
-        # so a resource replaced in between fails with 412 instead of mixing versions.
-        #
-        etag = self.response.headers.get("ETag", "")
-        last_modified = self.response.headers.get("Last-Modified")
+        super().__init__(
+            url,
+            mode,
+            buffer_size,
+            kerberos,
+            user,
+            password,
+            cert,
+            headers,
+            session,
+            timeout,
+            _defer_open=range_start is not None,
+        )
+        self._precondition: dict[str, str] = {}
+        self._version_pinned = False
+        self._partial: tuple[int, int, int | None] | None = None  # start, end, total from Content-Range
+        self.content_length = -1
+        self._seekable = True
+        if range_start is None:
+            assert self.response is not None  # noqa: S101  # set by super().__init__
+            self.content_length = _content_length(self.response)
+            #
+            # We assume the HTTP stream is seekable unless the server explicitly
+            # tells us it isn't.  It's better to err on the side of "seekable"
+            # because we don't want to prevent users from seeking a stream that
+            # does not appear to be seekable but really is.
+            #
+            self._seekable = self.response.headers.get("Accept-Ranges", "").lower() != "none"
+            #
+            # Range requests carry a precondition on the version of this first response,
+            # so a resource replaced in between fails with 412 instead of mixing versions.
+            #
+            self._pin_version(self.response)
+        else:
+            if range_stop is not None and range_stop < range_start:
+                msg = "range_stop must be >= range_start"
+                raise ValueError(msg)
+            self._failed = True
+            self.response = self._range_response(range_start, range_stop)
+            self._failed = False
+            self._current_pos = range_start
+            if self.response is not None:
+                if self._partial is None and self.response.status_code == requests.codes.partial_content:
+                    #
+                    # A 206 without Content-Range still tells us the body starts
+                    # at range_start, but not where the resource ends.  Track the
+                    # body as a partial response and keep the total unknown.
+                    #
+                    body_length = _content_length(self.response)
+                    if body_length > 0:
+                        self._partial = (range_start, range_start + body_length, None)
+                    self.content_length = -1
+                elif self._partial is None:
+                    self.content_length = _content_length(self.response)
+                elif self._partial[2] is not None:
+                    self.content_length = self._partial[2]
+                else:
+                    self.content_length = -1  # Content-Range says the total is unknown
+                self._seekable = self.response.headers.get("Accept-Ranges", "").lower() != "none"
+            elif range_start > 0:
+                # A 416 means the requested first byte is at or past EOF.
+                self.content_length = range_start
+
+    def _pin_version(self, response: requests.Response) -> None:
+        """Carry a precondition on the version of the first response we saw."""
+        if self._version_pinned:
+            return
+        etag = response.headers.get("ETag", "")
+        last_modified = response.headers.get("Last-Modified")
         if etag and not etag.startswith("W/"):  # If-Match compares strongly, so a weak ETag never matches
             self._precondition = {"If-Match": etag}
         elif last_modified:
             self._precondition = {"If-Unmodified-Since": last_modified}
-        else:
-            self._precondition = {}
-        self._partial: tuple[int, int, int | None] | None = None  # start, end, total from Content-Range
+        self._version_pinned = True
 
     def seek(self, offset: int, whence: int = 0) -> int:
         """Seek to the specified position.
@@ -446,9 +509,10 @@ class SeekableBufferedInputBase(BufferedInputBase):
         """Unsupported."""
         raise io.UnsupportedOperation
 
-    def _range_response(self, start_pos: int) -> requests.Response | None:
+    def _range_response(self, start_pos: int, stop_pos: int | None = None) -> requests.Response | None:
         self._partial = None
-        response = self._partial_request(start_pos)
+        response = self._partial_request(start_pos, stop_pos)
+        self._pin_version(response)
         if start_pos and response.status_code == requests.codes.ok:
             response.close()
             if 0 <= _content_length(response) <= start_pos:
@@ -495,10 +559,17 @@ class SeekableBufferedInputBase(BufferedInputBase):
         self._failed = False
         return self.response is not None
 
-    def _partial_request(self, start_pos: int | None = None) -> requests.Response:
+    def _partial_request(
+        self,
+        start_pos: int | None = None,
+        stop_pos: int | None = None,
+    ) -> requests.Response:
         headers = {**self._precondition, **self.headers}
         if start_pos is not None:
-            headers["range"] = smart_open.utils.make_range_string(start_pos)
+            headers["range"] = smart_open.utils.make_range_string(
+                start_pos,
+                None if stop_pos is None else stop_pos - 1,
+            )
 
         return self.session.get(
             self.url,

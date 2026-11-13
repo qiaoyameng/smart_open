@@ -228,6 +228,34 @@ with open("azure://mycontainer/my_file.txt", "wb", transport_params=transport_pa
     fout.write(b"hello world")
 ```
 
+### Byte-range Slice Views
+
+Large files often contain independently parseable sections.  `open_slice` opens
+a read-only view of a half-open byte range, with its own file cursor:
+
+```python
+import smart_open
+
+with smart_open.open_slice("collection.bin", 10_000, 20_000) as view:
+    header = view.read(4)       # bytes at transport offsets 10_000..10_003
+    view.seek(0, 2)             # seek relative to the end of the slice
+    slice_length = view.tell()
+    view.seek(0)
+    for line in view:
+        pass
+```
+
+Ranges address the raw bytes returned by the transport.  `open_slice` never
+applies compression or text decoding implicitly; if a slice is itself a
+complete compressed stream or text document, wrap the view explicitly with
+`gzip.GzipFile`, `io.TextIOWrapper`, etc.  Local paths and HTTP(S) sources are
+supported, and HTTP slices use bounded range requests whose follow-up requests
+stay pinned to the version first read.
+
+Views obtained from one already-open handle keep independent cursors, and
+closing such a view leaves the caller's handle open.  Pass `closefd=True` to
+make the view own a borrowed handle as well.
+
 ### Compression Handling
 
 The top-level `compression` parameter controls compression/decompression behavior when reading and writing.
